@@ -848,9 +848,19 @@ export class MemoryRepository implements RecoveryRepository {
         return { runId: run.id, proposal };
       }
       if (proposal) {
+        if (proposal.type === "document_response") {
+          recoveryCase.blocker = "missing_document";
+          recoveryCase.confidence = 0.95;
+          recoveryCase.reason = "Customer payment is blocked pending the matched delivery document";
+        } else if (proposal.type === "recovery_message" && this.world.paymentAttempts.some((attempt) => attempt.obligationId === recoveryCase.obligationId && attempt.status === "failed")) {
+          recoveryCase.blocker = "payment_failed";
+          recoveryCase.confidence = 0.99;
+          recoveryCase.reason = "A failed Razorpay authorization was matched to this purchase";
+        }
         const proposed = transitionCase(recoveryCase, "proposed");
         const awaiting = transitionCase({ ...proposed }, "awaiting_approval");
         Object.assign(recoveryCase, { ...awaiting, nextAction: proposal.intendedOutcome, updatedAt: nowIso() });
+        proposal.actionVersion = recoveryCase.version;
       } else {
         recoveryCase.nextAction = "No safe external action proposed; merchant review required";
         recoveryCase.updatedAt = nowIso();

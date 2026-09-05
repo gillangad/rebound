@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export function newId(_prefix = "id") {
+  void _prefix;
   return randomUUID();
 }
 
