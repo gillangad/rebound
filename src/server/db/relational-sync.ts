@@ -43,6 +43,7 @@ export async function replaceNormalizedWorld(db: Db, world: DemoWorld) {
   await db`delete from webhook_receipts where merchant_id = ${merchantId}`;
   await db`delete from payments where merchant_id = ${merchantId}`;
   await db`delete from payment_links where merchant_id = ${merchantId}`;
+  await db`delete from payment_attempts where merchant_id = ${merchantId}`;
   await db`delete from approvals where merchant_id = ${merchantId}`;
   await db`delete from jobs where merchant_id = ${merchantId}`;
   await db`delete from merchant_instructions where merchant_id = ${merchantId}`;
