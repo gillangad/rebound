@@ -34,10 +34,10 @@ describe("anonymous demo workspace boundaries", () => {
     expect(secondBootstrap.merchant.workspaceId).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
     expect(firstBootstrap.cases.map((item) => item.id)).not.toEqual(secondBootstrap.cases.map((item) => item.id));
 
-    const atelier = firstBootstrap.cases.find((item) => item.customer.displayName === "Atelier Works Pvt Ltd")!;
+    const atelier = firstBootstrap.cases.find((item) => item.customer.displayName === "City Interiors")!;
     await first.investigateCase(atelier.id);
     expect((await first.bootstrap()).cases.find((item) => item.id === atelier.id)?.documents).toHaveLength(1);
-    expect((await second.bootstrap()).cases.find((item) => item.customer.displayName === "Atelier Works Pvt Ltd")?.documents).toHaveLength(0);
+    expect((await second.bootstrap()).cases.find((item) => item.customer.displayName === "City Interiors")?.documents).toHaveLength(0);
     expect((await second.bootstrap()).proposals).toHaveLength(1);
   });
 });

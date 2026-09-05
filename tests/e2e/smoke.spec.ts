@@ -1,23 +1,30 @@
 import { expect, test } from "@playwright/test";
 
-test("merchant batch review, Atelier approval, secure customer page and history are usable", async ({ page }) => {
+test("merchant batch review, City Interiors approval, secure customer page and history are usable", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Review these cases" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Atelier Works Pvt Ltd" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "City Interiors" })).toBeVisible();
   await expect(page.getByText("Investigate next")).toBeVisible();
   await expect(page.getByText("Approval required")).toHaveCount(0);
-  await expect(page.getByText("Try Demo · isolated workspace")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Try Demo/ })).toBeVisible();
-  await page.getByRole("tab", { name: "Messages & documents" }).click();
-  await expect(page.getByText("No messages yet")).toBeVisible();
-  await page.getByRole("tab", { name: "Overview" }).click();
+  await expect(page.getByText("Private demo workspace")).toBeVisible();
+  await expect(page.getByText("Try Demo")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Reset demo/ })).toHaveCount(1);
+  await expect(page.getByRole("tab", { name: "Messages & documents" })).toHaveCount(0);
+  await expect(page.getByText("External evidence not retrieved yet.")).toBeVisible();
+  await page.getByRole("button", { name: /Aditi Mehra/ }).click();
+  await expect(page.getByText("Purchase correlation")).toBeVisible();
+  await expect(page.getByText("Checkout abandoned", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /City Interiors/ }).click();
 
   await page.getByRole("button", { name: "Switch to dark theme" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.getByRole("button", { name: "Switch to light theme" }).click();
 
+  const closeDevTools = page.getByRole("button", { name: "Close Next.js Dev Tools" });
+  if (await closeDevTools.isVisible()) await closeDevTools.click({ force: true });
+  await page.getByRole("button", { name: /Open Rebound agent activity/ }).press("Enter");
   await page.locator("#agent-instruction").fill("Review these cases independently, resolve what you can, and bring me anything that needs approval.");
-  await page.getByRole("button", { name: "Send instruction" }).click();
+  await page.getByRole("button", { name: "Submit agent request" }).click();
   await expect(page.getByText("Approval required").first()).toBeVisible();
   await expect(page.getByLabel("Evidence path")).toBeVisible();
   await expect(page.getByRole("dialog", { name: "Rebound agent" })).toBeVisible();
@@ -25,7 +32,7 @@ test("merchant batch review, Atelier approval, secure customer page and history 
 
   await page.getByRole("tab", { name: "Messages & documents" }).click();
   await expect(page.getByText("NW-DELIVERY-ATELIER-30-DESKS.txt")).toBeVisible();
-  await expect(page.getByText(/fixture · Customer Atelier Works Pvt Ltd.*readable delivery content match/)).toBeVisible();
+  await expect(page.getByText(/fixture · Customer City Interiors.*readable delivery content match/)).toBeVisible();
   await page.getByRole("tab", { name: "Overview" }).click();
 
   await page.getByRole("button", { name: "Approve & send" }).first().click();
@@ -55,7 +62,7 @@ test("merchant batch review, Atelier approval, secure customer page and history 
   await expect(page.getByRole("heading", { name: "Policies" }).first()).toBeVisible();
 
   await page.goto("/");
-  await page.getByRole("button", { name: /Open Rebound agent activity/ }).click();
+  await page.getByRole("button", { name: /Open Rebound agent activity/ }).press("Enter");
   await expect(page.getByRole("dialog", { name: "Rebound agent" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Rebound agent" })).toHaveCount(0);

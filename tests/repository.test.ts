@@ -21,10 +21,28 @@ function caseByName(repo: MemoryRepository, name: string) {
 }
 
 describe("fixture recovery service", () => {
-  it("starts with a clean Atelier case and runs one approval to one verified ledger posting", async () => {
+  it("answers bounded agent questions without creating a job or agent run", async () => {
+    const repo = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
+    const instructionCount = repo.world.instructions.length;
+    const runCount = repo.world.agentRuns.length;
+
+    const count = await repo.submitInstruction(undefined, "How many issues do we have?");
+    const affected = await repo.submitInstruction(undefined, "Which customers are affected?");
+    const blocker = await repo.submitInstruction(undefined, "What is blocking City Interiors?");
+    const greeting = await repo.submitInstruction(undefined, "Hi");
+
+    expect(count.message).toContain("open recovery issues");
+    expect(affected.message).toContain("City Interiors");
+    expect(blocker.message).toContain("External evidence not retrieved yet");
+    expect(greeting.message).toContain("I’m Rebound");
+    expect(repo.world.instructions).toHaveLength(instructionCount);
+    expect(repo.world.agentRuns).toHaveLength(runCount);
+  });
+
+  it("starts with a clean City Interiors case and runs one approval to one verified ledger posting", async () => {
     const repo = new MemoryRepository();
     const initial = await repo.bootstrap();
-    const atelier = initial.cases.find((item) => item.customer.displayName === "Atelier Works Pvt Ltd")!;
+    const atelier = initial.cases.find((item) => item.customer.displayName === "City Interiors")!;
 
     expect(initial.proposals.some((item) => item.caseId === atelier.id)).toBe(false);
     expect(initial.cases.find((item) => item.id === atelier.id)?.messages).toHaveLength(0);
@@ -67,14 +85,14 @@ describe("fixture recovery service", () => {
     expect(after.integrationProof).toMatchObject({ mode: "fixture", apiConfirmed: false, connectorRetrievedMessages: 0, connectorRetrievedDocuments: 0, providerSentEmails: 0, razorpayCreatedLinks: 0, signedRazorpayPayments: 0, verifiedCollectedAmount: 0 });
   });
 
-  it("investigates Aditi and Atelier independently with one bounded batch run", async () => {
+  it("investigates Aditi and City Interiors independently with one bounded batch run", async () => {
     const repo = new MemoryRepository();
     const batch = await runBatch(repo);
     expect(batch.caseIds).toHaveLength(2);
     expect(new Set(batch.caseIds).size).toBe(2);
     expect(batch.completedCaseIds).toHaveLength(2);
     const after = await repo.bootstrap();
-    for (const name of ["Aditi Mehra", "Atelier Works Pvt Ltd"]) {
+    for (const name of ["Aditi Mehra", "City Interiors"]) {
       const recoveryCase = after.cases.find((item) => item.customer.displayName === name)!;
       expect(after.proposals.filter((item) => item.caseId === recoveryCase.id && item.status === "pending")).toHaveLength(1);
       expect(recoveryCase.state).toBe("awaiting_approval");
@@ -88,7 +106,7 @@ describe("fixture recovery service", () => {
   it("denies a cross-customer document even if an approved proposal is tampered with", async () => {
     const repo = new MemoryRepository();
     await runBatch(repo);
-    const atelier = caseByName(repo, "Atelier Works Pvt Ltd");
+    const atelier = caseByName(repo, "City Interiors");
     const proposal = repo.world.proposals.find((item) => item.caseId === atelier.id && item.status === "pending")!;
     expect(repo.world.documents.some((item) => item.providerId === "fixture-drive-nw-delivery-lumen")).toBe(false);
     proposal.payload = { ...proposal.payload, documentId: "fixture-drive-nw-delivery-lumen" };
@@ -160,7 +178,7 @@ describe("fixture recovery service", () => {
   it("accepts only a captured or paid Razorpay event and ignores event and provider replays", async () => {
     const repo = new MemoryRepository();
     await runBatch(repo);
-    const atelier = caseByName(repo, "Atelier Works Pvt Ltd");
+    const atelier = caseByName(repo, "City Interiors");
     const proposal = repo.world.proposals.find((item) => item.caseId === atelier.id && item.status === "pending")!;
     const approved = await repo.decideProposal({ proposalId: proposal.id, decision: "approve", expectedCaseVersion: proposal.actionVersion });
     const link = approved.paymentLink!;
@@ -214,7 +232,7 @@ describe("fixture recovery service", () => {
 
     const overpaymentRepo = new MemoryRepository();
     await runBatch(overpaymentRepo);
-    const atelier = caseByName(overpaymentRepo, "Atelier Works Pvt Ltd");
+    const atelier = caseByName(overpaymentRepo, "City Interiors");
     const atelierProposal = overpaymentRepo.world.proposals.find((item) => item.caseId === atelier.id && item.status === "pending")!;
     const atelierApproval = await overpaymentRepo.decideProposal({ proposalId: atelierProposal.id, decision: "approve", expectedCaseVersion: atelierProposal.actionVersion });
     const overpayment = await overpaymentRepo.verifyFixturePayment(atelierApproval.paymentLink!.publicToken, atelierApproval.paymentLink!.amount + 100);
@@ -228,7 +246,7 @@ describe("fixture recovery service", () => {
   it("defers outside the contact window and blocks the attempt limit at execution", async () => {
     const outsideWindow = new MemoryRepository(undefined, () => new Date("2026-09-05T02:00:00.000Z"));
     await runBatch(outsideWindow);
-    const atelier = caseByName(outsideWindow, "Atelier Works Pvt Ltd");
+    const atelier = caseByName(outsideWindow, "City Interiors");
     const proposal = outsideWindow.world.proposals.find((item) => item.caseId === atelier.id && item.status === "pending")!;
     const deferred = await outsideWindow.decideProposal({ proposalId: proposal.id, decision: "approve", expectedCaseVersion: proposal.actionVersion });
     expect(deferred.proposal.status).toBe("approved");
@@ -256,7 +274,7 @@ describe("fixture recovery service", () => {
 
   it("skips a repeated investigation when the canonical evidence and policy hash is unchanged", async () => {
     const repo = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
-    const atelier = caseByName(repo, "Atelier Works Pvt Ltd");
+    const atelier = caseByName(repo, "City Interiors");
     const first = await repo.investigateCase(atelier.id);
     const runsAfterFirst = repo.world.agentRuns.length;
     const second = await repo.investigateCase(atelier.id);
@@ -278,7 +296,7 @@ describe("fixture recovery service", () => {
   it("keeps two demo workspace contexts isolated", async () => {
     const first = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
     const second = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
-    const firstCase = caseByName(first, "Atelier Works Pvt Ltd");
+    const firstCase = caseByName(first, "City Interiors");
     await first.investigateCase(firstCase.id);
     expect(second.world.proposals).toHaveLength(1);
     expect(second.world.documents).toHaveLength(0);

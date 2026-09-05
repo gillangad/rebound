@@ -25,7 +25,7 @@ import type {
   RecoveryCase,
   WebhookReceipt
 } from "@/shared/types";
-import { formatMoney } from "@/shared/formatters";
+import { formatMoney, titleCase } from "@/shared/formatters";
 import { evaluateProposal, isOrdinaryChasingEligible, nextContactWindowStart, type ProposalInput } from "@/server/domain/policy";
 import { correlateSignal } from "@/server/domain/correlation";
 import { resolveRelativeContactTime } from "@/server/domain/dates";
@@ -169,6 +169,81 @@ function summarizeCaseChange(record: RecoveryCase) {
   return { state: record.state, version: record.version, nextAction: record.nextAction, pauseReason: record.pauseReason, pauseUntil: record.pauseUntil };
 }
 
+function isGreeting(instruction: string) {
+  return /^(hi|hello|hey|good morning|good afternoon|good evening)[!. ]*$/i.test(instruction.trim());
+}
+
+function isWorkspaceQuestion(instruction: string) {
+  const lower = instruction.toLowerCase();
+  return isGreeting(instruction) || /how many (issues|cases|problems)|which customers? .*affected|who .*affected|highest[- ]priority|summari[sz]e .*cases|workspace summary|what('?s| is) happening/.test(lower);
+}
+
+function outstandingFor(world: DemoWorld, recoveryCase: RecoveryCase) {
+  const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
+  return obligation ? Math.max(0, obligation.amountDue - obligation.amountPaid) : 0;
+}
+
+function customerFor(world: DemoWorld, recoveryCase: RecoveryCase) {
+  return world.customers.find((item) => item.id === recoveryCase.customerId);
+}
+
+function answerWorkspaceQuestion(world: DemoWorld, instruction: string) {
+  if (isGreeting(instruction)) return "Hi — I’m Rebound. I can summarize this workspace, explain a selected case, review evidence, or pause/resume outreach where the policy allows it. External actions remain approval-gated.";
+  const openCases = world.cases.filter((item) => item.state !== "closed" && outstandingFor(world, item) > 0);
+  const pendingApprovals = world.proposals.filter((item) => item.status === "pending").length;
+  const pausedCases = openCases.filter((item) => item.state === "paused").length;
+  const affectedCustomers = [...new Set(openCases.map((item) => customerFor(world, item)?.displayName).filter((name): name is string => Boolean(name)))];
+  const lower = instruction.toLowerCase();
+  if (/how many (issues|cases|problems)/.test(lower)) return `There are ${openCases.length} open recovery issues across ${affectedCustomers.length} customers. ${pendingApprovals} await merchant approval and ${pausedCases} are paused by policy or incident controls.`;
+  if (/which customers? .*affected|who .*affected/.test(lower)) return affectedCustomers.length > 0 ? `Affected customers: ${affectedCustomers.join(", ")}. Rebound keeps their evidence and next action scoped to each obligation.` : "No customers currently have an outstanding recovery issue.";
+  if (/highest[- ]priority|summari[sz]e .*cases/.test(lower)) {
+    const priorityRank = { high: 0, medium: 1, low: 2 } as const;
+    const highest = openCases.slice().sort((left, right) => priorityRank[left.priority] - priorityRank[right.priority] || outstandingFor(world, right) - outstandingFor(world, left)).slice(0, 4);
+    const summary = highest.map((item) => `${customerFor(world, item)?.displayName || "Unknown customer"} — ${item.confidence === 0 ? "evidence review pending" : item.reason}`).join("; ");
+    return summary ? `Highest-priority cases: ${summary}.` : "There are no outstanding cases to summarize.";
+  }
+  return `I can answer “How many issues do we have?”, “Which customers are affected?”, or “Summarize the highest-priority cases.” Select a case for evidence, investigation, pause, or resume controls.`;
+}
+
+function answerCaseQuestion(world: DemoWorld, recoveryCase: RecoveryCase) {
+  const customer = customerFor(world, recoveryCase);
+  const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
+  const signals = world.signals.filter((item) => item.caseId === recoveryCase.id || item.obligationId === recoveryCase.obligationId);
+  const paymentAttempt = world.paymentAttempts.find((item) => item.obligationId === recoveryCase.obligationId);
+  const inbound = world.messages.find((item) => (item.caseId === recoveryCase.id || item.obligationId === recoveryCase.obligationId) && item.direction === "inbound");
+  const documents = world.documents.filter((item) => item.customerId === recoveryCase.customerId && item.obligationId === recoveryCase.obligationId);
+  const name = customer?.displayName || "This case";
+  if (recoveryCase.confidence === 0 && recoveryCase.workflow === "invoice_resolution") return `${name} is awaiting an evidence review. External evidence not retrieved yet; no blocker has been classified. Use Review evidence to retrieve the scoped Email and Drive records.`;
+  const evidence: string[] = [];
+  if (paymentAttempt?.status === "failed") evidence.push(`a failed Razorpay ${paymentAttempt.method} authorization${paymentAttempt.errorDescription ? ` (${paymentAttempt.errorDescription})` : ""}`);
+  if (signals.some((item) => item.type === "checkout_abandoned")) evidence.push("an abandoned-checkout signal");
+  if (inbound) evidence.push("one retrieved customer Email");
+  if (documents.length > 0) evidence.push(`the matched document ${documents[0].name}`);
+  if (recoveryCase.workflow === "failed_purchase" && paymentAttempt && signals.some((item) => item.type === "checkout_abandoned")) evidence.push(`both signals are correlated to one canonical purchase (${obligation?.orderRef || "order reference"})`);
+  const blocker = recoveryCase.confidence === 0 || recoveryCase.blocker === "no_response" ? "no blocker has been classified yet" : titleCase(recoveryCase.blocker).toLowerCase();
+  const evidenceText = evidence.length > 0 ? ` Evidence: ${evidence.join("; ")}.` : " No external evidence is attached to this case.";
+  return `${name} is ${titleCase(recoveryCase.state).toLowerCase()}. Current blocker: ${blocker}.${evidenceText} Next action: ${recoveryCase.nextAction}.`;
+}
+
+function findInstructionCase(world: DemoWorld, caseId: string | undefined, instruction: string) {
+  if (caseId) return world.cases.find((item) => item.id === caseId);
+  const lower = instruction.toLowerCase();
+  return world.cases.find((item) => {
+    const customer = customerFor(world, item);
+    return Boolean(customer && (lower.includes(customer.displayName.toLowerCase()) || (customer.company && lower.includes(customer.company.toLowerCase()))));
+  });
+}
+
+function instructionWrites(caseId: string | undefined, instruction: string) {
+  const lower = instruction.toLowerCase();
+  if (isWorkspaceQuestion(instruction) && !lower.includes("review these cases")) return false;
+  if (!caseId) return lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
+  if (/what .*block|blocking|current evidence|case status|explain .*status|explain .*evidence|why .*stuck|what happened/.test(lower)) return false;
+  if (/(^|\b)(unpause|resume|reopen)(\b|$)|resume outreach|continue outreach/.test(lower)) return true;
+  if (/\b(pause|stop outreach|do not contact|don't contact|investigate|review|retrieve|look into|find the blocker|run an evidence)\b/.test(lower)) return true;
+  return false;
+}
+
 function canonicalAgentInputHash(world: DemoWorld, recoveryCase: RecoveryCase, clock: () => Date) {
   const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
   const stable = {
@@ -196,7 +271,7 @@ function makeCaseView(world: DemoWorld, recoveryCase: RecoveryCase): CaseView {
     ...recoveryCase,
     customer,
     obligation,
-    signals: world.signals.filter((item) => item.caseId === recoveryCase.id),
+    signals: world.signals.filter((item) => item.caseId === recoveryCase.id || item.obligationId === obligation.id),
     paymentAttempt: world.paymentAttempts.find((item) => item.obligationId === obligation.id),
     paymentLink: world.paymentLinks.find((item) => item.obligationId === obligation.id && !["cancelled", "expired"].includes(item.status)),
     invoice: world.invoices.find((item) => item.obligationId === obligation.id),
@@ -908,7 +983,7 @@ export class MemoryRepository implements RecoveryRepository {
     const document = this.world.documents.find((item) => item.customerId === recoveryCase.customerId && item.obligationId === recoveryCase.obligationId && item.permission === "approved_customer_share");
     if (!document) throw new RepositoryError("NOT_FOUND", "No approved matching document is available.");
     const obligation = this.world.obligations.find((item) => item.id === recoveryCase.obligationId);
-    const proposal: Proposal = { id: newId("proposal"), merchantId: this.world.merchant.id, caseId: recoveryCase.id, obligationId: recoveryCase.obligationId, type: "document_response", intendedOutcome: "Remove the missing-document blocker and let the customer release the invoice.", recipient: customer?.email || "customer", scope: `${customer?.displayName || "Customer"} · matched invoice`, channel: "email", payload: { subject: "Signed delivery confirmation for your Northstar Office invoice", body: "Hi, sharing the signed delivery confirmation matched to your invoice. Once your team has this, you can release the outstanding balance. Reply here if anything else is needed.", documentId: document.id, createPaymentLink: true, amountMinor: Math.max(0, (obligation?.amountDue || 0) - (obligation?.amountPaid || 0)), currency: obligation?.currency || this.world.merchant.defaultCurrency, linkLabel: "Pay invoice" }, evidenceIds: [ ...(message ? [message.id] : []), document.id ], uncertainty: "The document matches this customer and obligation; payment timing remains with Atelier’s finance team.", explanation: "The latest inbound email requests a signed delivery confirmation. The matched document is permission-checked before sharing.", policy: evaluateProposal(this.world.policy, this.caseForPolicy(recoveryCase), contactPolicyInput(this.world, recoveryCase, { channel: "email", type: "document_response", externalAction: true }, this.clock)), requiresApproval: true, status: "pending", modelRunId, actionVersion: recoveryCase.version, createdAt: nowIso() };
+    const proposal: Proposal = { id: newId("proposal"), merchantId: this.world.merchant.id, caseId: recoveryCase.id, obligationId: recoveryCase.obligationId, type: "document_response", intendedOutcome: "Remove the missing-document blocker and let the customer release the invoice.", recipient: customer?.email || "customer", scope: `${customer?.displayName || "Customer"} · matched invoice`, channel: "email", payload: { subject: "Signed delivery confirmation for your Northstar Office invoice", body: "Hi, sharing the signed delivery confirmation matched to your invoice. Once your team has this, you can release the outstanding balance. Reply here if anything else is needed.", documentId: document.id, createPaymentLink: true, amountMinor: Math.max(0, (obligation?.amountDue || 0) - (obligation?.amountPaid || 0)), currency: obligation?.currency || this.world.merchant.defaultCurrency, linkLabel: "Pay invoice" }, evidenceIds: [ ...(message ? [message.id] : []), document.id ], uncertainty: "The document matches this customer and obligation; payment timing remains with City Interiors’ finance team.", explanation: "The latest inbound email requests a signed delivery confirmation. The matched document is permission-checked before sharing.", policy: evaluateProposal(this.world.policy, this.caseForPolicy(recoveryCase), contactPolicyInput(this.world, recoveryCase, { channel: "email", type: "document_response", externalAction: true }, this.clock)), requiresApproval: true, status: "pending", modelRunId, actionVersion: recoveryCase.version, createdAt: nowIso() };
     this.world.proposals.unshift(proposal);
     this.world.approvals.unshift({ id: newId("approval"), proposalId: proposal.id, requestedBy: "agent", decision: "pending", createdAt: nowIso() });
     return proposal;
@@ -977,8 +1052,12 @@ export class MemoryRepository implements RecoveryRepository {
   }
 
   async submitInstruction(caseId: string | undefined, instruction: string) {
-    const lower = instruction.toLowerCase();
-    const isBatch = !caseId || lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
+    const trimmed = instruction.trim();
+    const lower = trimmed.toLowerCase();
+    if (isWorkspaceQuestion(trimmed) && !lower.includes("review these cases")) return { message: answerWorkspaceQuestion(this.world, trimmed) };
+    const targetedCase = findInstructionCase(this.world, caseId, trimmed);
+    if (targetedCase && (/what .*block|blocking|current evidence|case status|explain .*status|explain .*evidence|why .*stuck|what happened/.test(lower))) return { case: targetedCase, message: answerCaseQuestion(this.world, targetedCase) };
+    const isBatch = lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
     if (isBatch) {
       const eligible = this.world.cases.filter((item) => {
         const obligation = this.world.obligations.find((candidate) => candidate.id === item.obligationId);
@@ -997,22 +1076,33 @@ export class MemoryRepository implements RecoveryRepository {
       if (this.fixtureAsync && this.selectedAgentProvider() === "fixture" && this.selectedEvidenceProvider() === "fixture") setTimeout(() => { void this.processFixtureBatch(batch, instructionRecord); }, 25);
       return { case: caseId ? this.getCase(caseId) : undefined, batchRun: batch, message: this.selectedAgentProvider() === "fixture" && this.selectedEvidenceProvider() === "fixture" ? `Batch review queued for ${batch.caseIds.length} eligible cases. The demo worker is retrieving evidence and preparing reviewable actions.` : `Batch review queued for ${batch.caseIds.length} eligible cases. The persistent worker will investigate them independently.` };
     }
-    if (!caseId) throw new RepositoryError("NOT_FOUND", "Select a case for a case-specific instruction.");
-    const recoveryCase = this.getCase(caseId);
+    if (!targetedCase) return { message: answerWorkspaceQuestion(this.world, trimmed) };
+    const recoveryCase = targetedCase;
+    if (/(^|\b)(unpause|resume|reopen)(\b|$)|resume outreach|continue outreach/.test(lower)) {
+      const resumed = await this.resumeCase(recoveryCase.id);
+      return { case: resumed, message: `I resumed ${customerFor(this.world, resumed)?.displayName || "this case"} for a fresh evidence recheck. No external message was sent.` };
+    }
     if (lower.includes("friday") || lower.includes("do not contact") || lower.includes("don't contact")) {
-      const pauseUntil = resolveRelativeContactTime(instruction.includes("friday") || instruction.includes("Friday") ? instruction : "Friday", this.clock(), this.world.policy).toISOString();
-      const instructionRecord: InstructionRecord = { id: newId("instruction"), merchantId: this.world.merchant.id, caseId, instruction, intent: "pause_contact", status: "queued", pauseUntil, createdAt: nowIso() };
+      const pauseUntil = resolveRelativeContactTime(trimmed.includes("friday") || trimmed.includes("Friday") ? trimmed : "Friday", this.clock(), this.world.policy).toISOString();
+      const instructionRecord: InstructionRecord = { id: newId("instruction"), merchantId: this.world.merchant.id, caseId: recoveryCase.id, instruction: trimmed, intent: "pause_contact", status: "queued", pauseUntil, createdAt: nowIso() };
       this.world.instructions.unshift(instructionRecord);
-      const paused = await this.pauseCase(caseId, `Merchant instruction persisted: do not contact before ${pauseUntil}`, pauseUntil);
-      const idempotencyKey = `case:${caseId}:instruction:${pauseUntil}`;
+      const paused = await this.pauseCase(recoveryCase.id, `Merchant instruction persisted: do not contact before ${pauseUntil}`, pauseUntil);
+      const idempotencyKey = `case:${recoveryCase.id}:instruction:${pauseUntil}`;
       if (!this.world.jobs.some((job) => job.idempotencyKey === idempotencyKey)) this.world.jobs.push({ id: newId("job"), merchantId: this.world.merchant.id, kind: "recheck_promise", idempotencyKey, status: "queued", caseId, runAfter: pauseUntil, attempts: 0 });
       instructionRecord.status = "completed";
       instructionRecord.completedAt = nowIso();
-      this.addAudit({ actor: "merchant", eventType: "instruction.persisted", entityType: "case", entityId: caseId, summary: "Merchant instruction persisted as a policy-constrained recheck job.", after: { instructionId: instructionRecord.id, instruction, pauseUntil }, sourceIds: [] });
-      return { case: paused, message: `I paused outreach and scheduled a recheck for ${pauseUntil}. A promise is not treated as payment authorization.` };
+      this.addAudit({ actor: "merchant", eventType: "instruction.persisted", entityType: "case", entityId: recoveryCase.id, summary: "Merchant instruction persisted as a policy-constrained recheck job.", after: { instructionId: instructionRecord.id, instruction: trimmed, pauseUntil }, sourceIds: [] });
+      return { case: paused, message: `I paused outreach for ${customerFor(this.world, paused)?.displayName || "this case"} and scheduled a recheck for ${pauseUntil}. A promise is not treated as payment authorization.` };
     }
-    await this.investigateCase(caseId);
-    return { case: recoveryCase, message: "I recorded the request and started a bounded evidence review." };
+    if (/\b(pause|stop outreach|do not contact|don't contact)\b/.test(lower)) {
+      const paused = await this.pauseCase(recoveryCase.id, "Merchant paused outreach from the bounded agent controls");
+      return { case: paused, message: `I paused outreach for ${customerFor(this.world, paused)?.displayName || "this case"}. No customer-facing action was sent.` };
+    }
+    if (/\b(investigate|review|retrieve|look into|find the blocker|run an evidence)\b/.test(lower)) {
+      const result = await this.investigateCase(recoveryCase.id);
+      return { case: this.getCase(recoveryCase.id), message: ("skipped" in result && result.skipped) ? "This case already has the same evidence hash, so I skipped a duplicate provider call." : `I started a bounded evidence review for ${customerFor(this.world, recoveryCase)?.displayName || "this case"}. I will stop at a proposal or an evidence gap.` };
+    }
+    return { case: recoveryCase, message: answerCaseQuestion(this.world, recoveryCase) };
   }
 
   async resolveIncident(incidentId: string) {
@@ -1335,7 +1425,8 @@ export class PostgresRepository implements RecoveryRepository {
     this.db = drizzle(this.client);
   }
 
-  private async run<T>(fn: (repo: MemoryRepository) => Promise<T>) {
+  private async run<T>(fn: (repo: MemoryRepository) => Promise<T>, options: { persist?: boolean } = {}) {
+    const persist = options.persist ?? true;
     let result!: T;
     await this.client.begin(async (tx) => {
       const publicToken = this.options.publicToken;
@@ -1358,10 +1449,11 @@ export class PostgresRepository implements RecoveryRepository {
       }
       if (!workspaceId) throw new RepositoryError("WORKSPACE_REQUIRED", "A signed demo workspace is required for merchant operations.");
 
-      // The domain aggregate is hydrated and persisted as one unit. The lock
-      // is derived from the tenant, so unrelated browser workspaces never
-      // block or overwrite one another.
-      await tx`select pg_advisory_xact_lock(hashtextextended(${workspaceId}, 481927))`;
+      // Mutations take a tenant-scoped lock. A missing snapshot is the one
+      // read-time exception: first-visit initialization must be atomic and
+      // idempotent, but an existing read never rewrites normalized state.
+      const needsInitialization = lookupRows.length === 0;
+      if (persist || needsInitialization) await tx`select pg_advisory_xact_lock(hashtextextended(${workspaceId}, 481927))`;
       const rows = await tx`select payload from recovery_state where workspace_id = ${workspaceId} limit 1` as Array<{ payload: DemoWorld }>;
       const stored = rows[0]?.payload;
       const config = runtimeConfig();
@@ -1376,35 +1468,37 @@ export class PostgresRepository implements RecoveryRepository {
       }
       const repo = new MemoryRepository(stored || createDemoWorld(workspaceId, capabilityStatus()), undefined, { fixtureAsync: false });
       result = await fn(repo);
-      await replaceNormalizedWorld(tx, repo.world);
-      await tx`
-        insert into recovery_state (workspace_id, merchant_id, payload, updated_at)
-        values (${workspaceId}, ${repo.world.merchant.id}, ${JSON.stringify(repo.world)}::jsonb, now())
-        on conflict (workspace_id) do update set merchant_id = excluded.merchant_id, payload = excluded.payload, updated_at = now()
-      `;
+      if (persist || !stored) {
+        await replaceNormalizedWorld(tx, repo.world);
+        await tx`
+          insert into recovery_state (workspace_id, merchant_id, payload, updated_at)
+          values (${workspaceId}, ${repo.world.merchant.id}, ${JSON.stringify(repo.world)}::jsonb, now())
+          on conflict (workspace_id) do update set merchant_id = excluded.merchant_id, payload = excluded.payload, updated_at = now()
+        `;
+      }
     });
     return result;
   }
 
-  async bootstrap() { return this.run((repo) => repo.bootstrap()); }
-  async getCaseView(caseId: string) { return this.run((repo) => repo.getCaseView(caseId)); }
-  async getCustomerPage(token: string) { return this.run((repo) => repo.getCustomerPage(token)); }
+  async bootstrap() { return this.run((repo) => repo.bootstrap(), { persist: false }); }
+  async getCaseView(caseId: string) { return this.run((repo) => repo.getCaseView(caseId), { persist: false }); }
+  async getCustomerPage(token: string) { return this.run((repo) => repo.getCustomerPage(token), { persist: false }); }
   async decideProposal(input: DecideProposalInput) { return this.run((repo) => repo.decideProposal(input)); }
   async investigateCase(caseId: string, invocationReason?: AgentInvocationReason) { return this.run((repo) => repo.investigateCase(caseId, invocationReason)); }
   async pauseCase(caseId: string, reason: string, pauseUntil?: string) { return this.run((repo) => repo.pauseCase(caseId, reason, pauseUntil)); }
   async resumeCase(caseId: string) { return this.run((repo) => repo.resumeCase(caseId)); }
-  async submitInstruction(caseId: string | undefined, instruction: string) { return this.run((repo) => repo.submitInstruction(caseId, instruction)); }
+  async submitInstruction(caseId: string | undefined, instruction: string) { return this.run((repo) => repo.submitInstruction(caseId, instruction), { persist: instructionWrites(caseId, instruction) }); }
   async resolveIncident(incidentId: string) { return this.run((repo) => repo.resolveIncident(incidentId)); }
   async updatePolicy(input: Partial<Pick<Policy, "reviewFirst" | "allowedChannels" | "contactStartHour" | "contactEndHour" | "timezone" | "maxAttempts" | "minimumSpacingHours" | "discountsAllowed" | "incidentSuppression">>) { return this.run((repo) => repo.updatePolicy(input)); }
   async verifyFixturePayment(token: string, amount?: number) { return this.run((repo) => repo.verifyFixturePayment(token, amount)); }
   async ingestRazorpayEvent(eventId: string, event: Record<string, unknown>, rawBody?: string) { return this.run((repo) => repo.ingestRazorpayEvent(eventId, event, rawBody)); }
-  async audit(filter?: string) { return this.run((repo) => repo.audit(filter)); }
+  async audit(filter?: string) { return this.run((repo) => repo.audit(filter), { persist: false }); }
   async jobs() {
     if (!this.options.workspaceId && !this.options.publicToken) {
       const rows = await this.client`select payload from recovery_state` as Array<{ payload: DemoWorld }>;
       return rows.flatMap((row) => Array.isArray(row.payload?.jobs) ? row.payload.jobs : []) as JobRecord[];
     }
-    return this.run((repo) => repo.jobs());
+    return this.run((repo) => repo.jobs(), { persist: false });
   }
   async markJob(idempotencyKey: string, status: JobRecord["status"], lastError?: string) { return this.run((repo) => repo.markJob(idempotencyKey, status, lastError)); }
   async completeBatchCase(batchRunId: string, caseId: string, error?: string) { return this.run((repo) => repo.completeBatchCase(batchRunId, caseId, error)); }

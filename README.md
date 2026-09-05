@@ -1,6 +1,6 @@
 # Rebound
 
-Rebound is an evidence-led merchant workspace for payment recovery. The flagship demo is Northstar Office and Atelier Works: an invoice blocker is retrieved from simulated Email and Drive evidence, converted into one approval-gated response, delivered with a secure document link and payment route, and collected only after a verified payment event.
+Rebound is an evidence-led merchant workspace for payment recovery. The flagship demo is Northstar Office and City Interiors: an invoice blocker is retrieved from simulated Email and Drive evidence, converted into one approval-gated response, delivered with a secure document link and payment route, and collected only after a verified payment event.
 
 The server owns correlation, policy checks, case transitions, approval revalidation, payment reconciliation, idempotency, audit history and the verified ledger. The agent can investigate and propose; it cannot claim payment success or perform an external action by itself.
 
@@ -29,7 +29,7 @@ npm run worker
 
 `npm run worker` is a persistent pg-boss worker. It processes queued jobs, restores jobs left running during a restart, and routes each mutation to the tenant that owns the job. `npm run dev:all` starts the web server and the worker only when `DATABASE_URL` is present; without it, the console says that the durable worker is not running.
 
-The hosted Try Demo path is anonymous but isolated. The first merchant API request receives a signed `HttpOnly; SameSite=Lax` `recovery_demo_session` cookie. Its workspace ID selects a PostgreSQL snapshot; another browser receives another workspace. `Try Demo · Fresh start` or `POST /api/demo/reset` replaces only that workspace with the canonical starting state and records a reset audit event.
+The anonymous demo path is isolated. The first merchant API request receives a signed `HttpOnly; SameSite=Lax` `recovery_demo_session` cookie. Its workspace ID selects a PostgreSQL snapshot; another browser receives another workspace. `Reset demo` or `POST /api/demo/reset` replaces only that workspace with the canonical starting state and records a reset audit event.
 
 ## Independent provider capabilities
 
@@ -50,7 +50,7 @@ When `AGENT_PROVIDER=codex_app_server`, the server launches `CODEX_APP_SERVER_CO
 
 ## Product flow
 
-1. Open `/` and select Atelier Works. The reset state has no Atelier message, document, proposal, outbound message, active link, payment or ledger entry.
+1. Open `/` and select City Interiors. The reset state has no City Interiors message, document, proposal, outbound message, active link, payment or ledger entry.
 2. Submit `Review these cases. Resolve what you can within our policies, and bring me anything that needs approval.` The API persists the instruction and batch immediately; the worker or local fixture worker advances it asynchronously.
 3. Inspect the evidence path: retrieved fixture Email → customer/invoice/order-matched Drive document → one `document_response` proposal. The Lumen document is a provider-corpus distractor and is rejected with an audit event.
 4. Edit, approve or reject. Approval rechecks case version, recipient, document ownership/permission, outstanding balance, contact window, attempt spacing, incident and changed-circumstance rules. The sent fixture message is labelled simulation and contains both the obligation-scoped document URL and payment route.
@@ -78,7 +78,7 @@ npm run build
 npm run e2e
 ```
 
-The tests cover controlled clocks, policy and state transitions, fixture Email/Drive retrieval and distractor rejection, evidence-backed Atelier proposals, secure document/payment delivery, approval and job idempotency, signed Razorpay event validation, partial/full/overpayment reconciliation, signal deduplication, incident revalidation, changed circumstances, evaluation reproducibility and isolated demo workspaces. The browser smoke test covers reset/initial state, asynchronous batch progress, evidence inspection, approval, customer payment, refresh-visible recovery and secondary surfaces.
+The tests cover controlled clocks, policy and state transitions, fixture Email/Drive retrieval and distractor rejection, evidence-backed City Interiors proposals, secure document/payment delivery, approval and job idempotency, signed Razorpay event validation, partial/full/overpayment reconciliation, signal deduplication, incident revalidation, changed circumstances, evaluation reproducibility and isolated demo workspaces. The browser smoke test covers reset/initial state, asynchronous batch progress, evidence inspection, approval, customer payment, refresh-visible recovery and secondary surfaces.
 
 ## Deployment readiness
 

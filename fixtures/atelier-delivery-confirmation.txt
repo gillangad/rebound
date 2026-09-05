@@ -3,7 +3,7 @@ SIGNED DELIVERY CONFIRMATION
 
 Invoice: NSO-INV-2048
 Order: NSO-PO-8831
-Customer: Atelier Works Pvt Ltd
+Customer: City Interiors
 Goods: 30 standing desks, walnut finish
 Delivered: 28 August 2026
 Received by: Priya Menon, Finance Manager

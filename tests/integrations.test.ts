@@ -39,7 +39,7 @@ describe("Google connector boundaries", () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ files: [{ id: "drive-doc-1", name: "NW delivery confirmation", mimeType: "application/vnd.google-apps.document", webViewLink: "https://drive.google.com/file/d/drive-doc-1/view", modifiedTime: "2026-09-04T08:00:00.000Z" }] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ id: "drive-doc-1", name: "NW delivery confirmation", mimeType: "application/vnd.google-apps.document", webViewLink: "https://drive.google.com/file/d/drive-doc-1/view" }), { status: 200 }))
-      .mockResolvedValueOnce(new Response("Invoice: NSO-INV-2048\nCustomer: Atelier Works Pvt Ltd", { status: 200 }));
+      .mockResolvedValueOnce(new Response("Invoice: NSO-INV-2048\nCustomer: City Interiors", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
     const adapter = new GoogleDriveAdapter("encrypted-test-token");
@@ -62,14 +62,14 @@ describe("Google connector boundaries", () => {
       if (url.includes("gmail.googleapis.com") && url.includes("/messages?q=")) return new Response(JSON.stringify({ messages: [{ id: "gmail-atelier-1" }] }), { status: 200 });
       if (url.includes("gmail.googleapis.com") && url.includes("/messages/gmail-atelier-1")) return new Response(JSON.stringify({ id: "gmail-atelier-1", threadId: "gmail-thread-atelier-1", internalDate: "1788509400000", payload: { headers: [{ name: "Subject", value: "Delivery confirmation needed for NSO-INV-2048" }, { name: "From", value: "priya@atelierworks.example" }, { name: "To", value: "collections@northstar.example" }], body: { data: Buffer.from("Finance needs signed delivery confirmation for NSO-INV-2048 and NSO-PO-8831.").toString("base64url") } } }), { status: 200 });
       if (url.includes("drive/v3/files?") && !url.includes("/export?")) return new Response(JSON.stringify({ files: [{ id: "drive-atelier-1", name: "NW-DELIVERY-ATELIER-30-DESKS", mimeType: "application/vnd.google-apps.document", webViewLink: "https://drive.google.com/file/d/drive-atelier-1/view" }] }), { status: 200 });
-      if (url.includes("/export?")) return new Response("Customer: Atelier Works Pvt Ltd\nInvoice: NSO-INV-2048\nPurchase order: NSO-PO-8831\nSigned delivery confirmation: 30 desks received.", { status: 200 });
+      if (url.includes("/export?")) return new Response("Customer: City Interiors\nInvoice: NSO-INV-2048\nPurchase order: NSO-PO-8831\nSigned delivery confirmation: 30 desks received.", { status: 200 });
       if (url.includes("drive/v3/files/drive-atelier-1")) return new Response(JSON.stringify({ id: "drive-atelier-1", name: "NW-DELIVERY-ATELIER-30-DESKS", mimeType: "application/vnd.google-apps.document", webViewLink: "https://drive.google.com/file/d/drive-atelier-1/view" }), { status: 200 });
       return new Response("not found", { status: 404 });
     });
     vi.stubGlobal("fetch", fetchMock);
 
     const repo = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
-    const atelier = repo.world.cases.find((item) => repo.world.customers.find((customer) => customer.id === item.customerId)?.displayName === "Atelier Works Pvt Ltd")!;
+    const atelier = repo.world.cases.find((item) => repo.world.customers.find((customer) => customer.id === item.customerId)?.displayName === "City Interiors")!;
     await repo.investigateCase(atelier.id);
     expect(repo.world.messages.find((item) => item.caseId === atelier.id)).toMatchObject({ providerMode: "live", providerId: "gmail-atelier-1" });
     expect(repo.world.documents.find((item) => item.obligationId === atelier.obligationId)).toMatchObject({ providerMode: "live", providerId: "drive-atelier-1" });
