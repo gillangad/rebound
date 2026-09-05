@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -30,15 +30,31 @@ import type { LucideIcon } from "lucide-react";
 import type { BootstrapPayload, CaseView, Incident, Policy, Proposal, RuntimeCapabilities } from "@/shared/types";
 import { NAV_ITEMS } from "@/shared/constants";
 import { formatDateTime, formatMoney, formatRelative, titleCase } from "@/shared/formatters";
-import { AgentOrb, type OrbState } from "@/components/agent-orb";
+import { AgentOrb, findSafeFloatingPosition, FLOATING_INSET, type FloatingPosition, type OrbState } from "@/components/agent-orb";
 import { CaseStatusLine, EmptyState, SourceChip, StatusBadge, initials } from "@/components/ui";
-import type { ComponentProps, Dispatch, FormEvent, SetStateAction } from "react";
+import type { ComponentProps, CSSProperties, Dispatch, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, SetStateAction } from "react";
 
 type Section = "recovery" | "approvals" | "incidents" | "connections" | "history" | "policies";
 const icons: Record<string, LucideIcon> = { pulse: Activity, check: CheckCircle2, triangle: TriangleAlert, layers: Layers3, history: HistoryIcon, sliders: SlidersHorizontal };
+type AgentMessage = { id: string; role: "user" | "assistant"; text: string };
+
+let bootstrapCache: BootstrapPayload | null = null;
+let bootstrapRequest: Promise<BootstrapPayload> | null = null;
+
+async function loadBootstrap(force = false) {
+  if (!force && bootstrapCache) return bootstrapCache;
+  if (bootstrapRequest) return bootstrapRequest;
+  bootstrapRequest = fetch("/api/bootstrap", { cache: "no-store" }).then(async (response) => {
+    const payload = await response.json() as BootstrapPayload & { error?: { message?: string } };
+    if (!response.ok) throw new Error(payload.error?.message || "Could not load workspace.");
+    bootstrapCache = payload;
+    return payload;
+  }).finally(() => { bootstrapRequest = null; });
+  return bootstrapRequest;
+}
 
 export function MerchantShell({ section }: { section: Section }) {
-  const [data, setData] = useState<BootstrapPayload | null>(null);
+  const [data, setData] = useState<BootstrapPayload | null>(() => bootstrapCache);
   const [error, setError] = useState<string | null>(null);
   const [selectedCaseId, setSelectedCaseId] = useState<string | undefined>();
   const [selectedIncidentId, setSelectedIncidentId] = useState<string | undefined>();
@@ -52,15 +68,14 @@ export function MerchantShell({ section }: { section: Section }) {
   const [editingProposalId, setEditingProposalId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, { subject: string; body: string }>>({});
   const [policyDraft, setPolicyDraft] = useState<Partial<Policy>>({});
+  const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
     try {
-      const response = await fetch("/api/bootstrap", { cache: "no-store" });
-      const payload = await response.json() as BootstrapPayload & { error?: { message?: string } };
-      if (!response.ok) throw new Error(payload.error?.message || "Could not load workspace.");
+      const payload = await loadBootstrap(force);
       setData(payload);
       setError(null);
-      setSelectedCaseId((current) => current && payload.cases.some((item) => item.id === current) ? current : payload.cases.find((item) => item.customer.displayName === "Atelier Works Pvt Ltd")?.id || payload.cases.find((item) => item.blocker === "missing_document")?.id || payload.cases.find((item) => item.primary !== false)?.id);
+      setSelectedCaseId((current) => current && payload.cases.some((item) => item.id === current) ? current : payload.cases.find((item) => item.customer.displayName === "City Interiors")?.id || payload.cases.find((item) => item.blocker === "missing_document")?.id || payload.cases.find((item) => item.primary !== false)?.id);
       setPolicyDraft(payload.policy);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Could not load workspace.");
@@ -68,7 +83,7 @@ export function MerchantShell({ section }: { section: Section }) {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    void refresh(!bootstrapCache);
     const savedTheme = window.localStorage.getItem("recovery-theme") as "light" | "dark" | null;
     const initialTheme = savedTheme || "light";
     setTheme(initialTheme);
@@ -79,15 +94,20 @@ export function MerchantShell({ section }: { section: Section }) {
   useEffect(() => {
     if (!pollingState) return;
     const intervalMs = pollingState === "working" || pollingState === "inspecting" ? 1300 : 7000;
-    const timer = window.setInterval(() => void refresh(), intervalMs);
+    const timer = window.setInterval(() => void refresh(true), intervalMs);
     return () => window.clearInterval(timer);
   }, [pollingState, refresh]);
 
+  const closeDrawer = useCallback(() => {
+    setDrawerOpen(false);
+    window.requestAnimationFrame(() => document.getElementById("agent-orb-trigger")?.focus());
+  }, []);
+
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setDrawerOpen(false); };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape" && drawerOpen) closeDrawer(); };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [closeDrawer, drawerOpen]);
 
   const mutate = async (key: string, url: string, body?: Record<string, unknown>) => {
     setBusyKey(key);
@@ -97,7 +117,7 @@ export function MerchantShell({ section }: { section: Section }) {
       const result = await response.json() as { error?: { message?: string }; message?: string };
       if (!response.ok) throw new Error(result.error?.message || "Action could not be completed.");
       setNotice(typeof result.message === "string" ? result.message : "Saved.");
-      await refresh();
+      await refresh(true);
       return result;
     } catch (actionError) {
       setNotice(actionError instanceof Error ? actionError.message : "Action could not be completed.");
@@ -113,15 +133,20 @@ export function MerchantShell({ section }: { section: Section }) {
   const pendingApprovalCount = data?.proposals.filter((item) => item.status === "pending").length || 0;
   const activeIncidentCount = data?.incidents.filter((item) => item.status === "active").length || 0;
   const orbState = useMemo<OrbState>(() => {
+    if (!data) return "idle";
+    const reportedState = data.orb.state;
+    if ((reportedState === "uncertain" || reportedState === "error") && (!selectedCase || !data.orb.caseId || data.orb.caseId === selectedCase.id)) return reportedState;
     if (selectedIncident?.status === "active") return "paused";
-    if (!selectedCase) return data?.orb.state || "idle";
+    if (!selectedCase) return reportedState;
     if (selectedCase.state === "awaiting_approval") return "approval";
     if (selectedCase.state === "paused") return "paused";
     if (selectedCase.state === "recovered") return "success";
-    if (selectedCase.state === "investigating" || selectedCase.state === "proposed") return "working";
-    return data?.orb.state || "idle";
-  }, [data?.orb.state, selectedCase, selectedIncident]);
-  const orbLabel = orbState === "approval" ? "Approval required" : orbState === "paused" ? "Outreach paused" : orbState === "success" ? "Payment verified" : orbState === "working" ? "Investigating" : orbState === "inspecting" ? "Retrieving evidence" : orbState === "uncertain" ? "Needs review" : orbState === "error" ? "Provider needs attention" : "Agent idle";
+    if (data.orb.caseId === selectedCase.id && (reportedState === "inspecting" || reportedState === "working")) return reportedState;
+    if (selectedCase.state === "investigating") return reportedState === "inspecting" ? "inspecting" : "working";
+    if (selectedCase.state === "proposed") return selectedCase.proposals.some((proposal) => proposal.status === "pending" && proposal.requiresApproval) ? "approval" : "working";
+    return reportedState === "inspecting" || reportedState === "working" ? reportedState : "idle";
+  }, [data, selectedCase, selectedIncident]);
+  const orbLabel = orbState === "approval" ? "Approval required" : orbState === "paused" ? "Paused" : orbState === "success" ? "Payment verified" : orbState === "working" || orbState === "inspecting" ? "Investigating" : orbState === "uncertain" ? "Needs review" : orbState === "error" ? "Provider needs attention" : "Agent idle";
 
   const toggleTheme = () => {
     const next = theme === "light" ? "dark" : "light";
@@ -132,9 +157,15 @@ export function MerchantShell({ section }: { section: Section }) {
 
   const submitInstruction = async (event: FormEvent) => {
     event.preventDefault();
-    if (!instruction.trim()) return;
-    const result = await mutate("instruction", "/api/instructions", { caseId: selectedCaseId, instruction: instruction.trim() });
-    if (result) { setInstruction(""); setDrawerOpen(true); }
+    const request = instruction.trim();
+    if (!request) return;
+    setAgentMessages((current) => [...current, { id: `${Date.now()}-user`, role: "user", text: request }]);
+    setInstruction("");
+    const result = await mutate("instruction", "/api/instructions", { caseId: selectedCaseId, instruction: request });
+    if (result) {
+      setAgentMessages((current) => [...current, { id: `${Date.now()}-assistant`, role: "assistant", text: typeof result.message === "string" ? result.message : "I could not produce a bounded response." }]);
+      setDrawerOpen(true);
+    }
   };
 
   const resetDemo = async () => {
@@ -157,11 +188,11 @@ export function MerchantShell({ section }: { section: Section }) {
     await mutate(`reject-${proposal.id}`, `/api/proposals/${proposal.id}/decision`, { decision: "reject", expectedCaseVersion: recoveryCase?.version, rationale: "Merchant chose not to send this proposal." });
   };
 
-  if (!data) return <div className="app-shell"><aside className="sidebar" /><main className="main-shell"><div className="topbar"><h1 className="page-title">Rebound</h1></div><div className="content"><div className="loading-state">{error || "Loading Northstar Office workspace…"}</div></div></main></div>;
+  if (!data) return <div className="app-shell"><aside className="sidebar" /><main className="main-shell"><div className="topbar"><h1 className="page-title">Rebound</h1></div><div className="content"><div className="loading-state">{error || "Loading workspace…"}</div></div></main></div>;
 
   const primaryCases = data.cases.filter((item) => item.primary !== false).sort((left, right) => {
-    const leftFlagship = left.customer.displayName === "Atelier Works Pvt Ltd";
-    const rightFlagship = right.customer.displayName === "Atelier Works Pvt Ltd";
+    const leftFlagship = left.customer.displayName === "City Interiors";
+    const rightFlagship = right.customer.displayName === "City Interiors";
     if (leftFlagship !== rightFlagship) return leftFlagship ? -1 : 1;
     return left.updatedAt < right.updatedAt ? 1 : left.updatedAt > right.updatedAt ? -1 : 0;
   });
@@ -173,18 +204,17 @@ export function MerchantShell({ section }: { section: Section }) {
       <nav className="nav" aria-label="Primary">
         {NAV_ITEMS.map((item) => { const Icon = icons[item.icon]; const itemSection = item.href.slice(1) as Section; return <Link href={item.href} key={item.href} className={`nav-item ${section === itemSection ? "active" : ""}`} aria-current={section === itemSection ? "page" : undefined}><Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span>{item.label}</span>{itemSection === "approvals" && pendingApprovalCount > 0 && <span className="nav-badge">{pendingApprovalCount}</span>}{itemSection === "incidents" && activeIncidentCount > 0 && <span className="nav-badge">{activeIncidentCount}</span>}</Link>; })}
       </nav>
-      <button type="button" className="try-demo-button" onClick={() => void resetDemo()} disabled={busyKey === "reset-demo"}><Sparkles size={15} />{busyKey === "reset-demo" ? "Resetting…" : "Try Demo · Fresh start"}</button>
       <div className="sidebar-spacer" />
       <div className="connector-health"><span className={`health-dot ${data.capabilities.evidence.status === "unsupported" || data.capabilities.payment.status === "not_configured" ? "error" : data.capabilities.storage.status === "not_configured" ? "neutral" : ""}`} /> Evidence · payments · workspace<br /><span style={{ marginLeft: 13 }}>{data.merchant.demo ? "isolated demo workspace" : "provider status shown below"}</span></div>
       <div className="merchant-footer"><div className="merchant-avatar">NO</div><div><div className="merchant-name">Northstar Office</div><div className="merchant-role">Merchant admin</div></div></div>
     </aside>
     <main className="main-shell">
-      <header className="topbar"><div className="topbar-title"><h1 className="page-title">{currentTitle}</h1><span className="mode-pill">{data.merchant.demo ? "Try Demo · isolated workspace" : data.mode === "fixture" ? "Fixture providers" : "Selected live/test providers"}</span></div><div className="header-summaries"><span className="summary">Outstanding <strong>{formatMoney(data.summary.outstanding, data.summary.currency)}</strong></span><span className="summary">Verified recovered <strong>{formatMoney(data.summary.verifiedRecovered, data.summary.currency)}</strong></span></div><div className="topbar-actions"><button type="button" className="icon-button" onClick={() => void refresh()} aria-label="Refresh workspace"><RefreshCcw size={17} /></button><button type="button" className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button></div></header>
+      <header className="topbar"><div className="topbar-title"><h1 className="page-title">{currentTitle}</h1><span className="mode-pill">{data.merchant.demo ? "Private demo workspace" : data.mode === "fixture" ? "Fixture providers" : "Selected live/test providers"}</span></div><div className="header-summaries"><span className="summary">Outstanding <strong>{formatMoney(data.summary.outstanding, data.summary.currency)}</strong></span><span className="summary">Verified recovered <strong>{formatMoney(data.summary.verifiedRecovered, data.summary.currency)}</strong></span></div><div className="topbar-actions"><button type="button" className="icon-button" onClick={() => void refresh(true)} aria-label="Refresh workspace"><RefreshCcw size={17} /></button><button type="button" className="icon-button" onClick={toggleTheme} aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button></div></header>
       <div className="content">
         {notice && <div className="error-banner" style={{ color: "var(--text-2)", marginBottom: 14 }} role="status"><CircleHelp size={15} />{notice}</div>}
         {error && <div className="error-banner" style={{ marginBottom: 14 }} role="alert"><AlertTriangle size={15} />{error}</div>}
         <CapabilityStrip capabilities={data.capabilities} />
-        {section === "recovery" && <RecoveryView data={data} primaryCases={primaryCases} activeIncidents={activeIncidents} selectedCaseId={selectedCaseId} selectedIncidentId={selectedIncidentId} selectedCase={selectedCase} selectedIncident={selectedIncident} selectedTab={tab} setSelectedCaseId={(id) => { setSelectedCaseId(id); setSelectedIncidentId(undefined); setTab("evidence"); }} setSelectedIncidentId={(id) => { setSelectedIncidentId(id); setSelectedCaseId(undefined); }} setTab={setTab} busyKey={busyKey} editingProposalId={editingProposalId} setEditingProposalId={setEditingProposalId} drafts={drafts} setDrafts={setDrafts} onApprove={approveProposal} onReject={rejectProposal} onInvestigate={(id) => void mutate(`investigate-${id}`, `/api/cases/${id}/investigate`, {})} onResolveIncident={(id) => void mutate(`resolve-${id}`, `/api/incidents/${id}/resolve`, {})} onInstructionSubmit={submitInstruction} instruction={instruction} setInstruction={setInstruction} onResetDemo={resetDemo} />}
+        {section === "recovery" && <RecoveryView data={data} primaryCases={primaryCases} activeIncidents={activeIncidents} selectedCaseId={selectedCaseId} selectedIncidentId={selectedIncidentId} selectedCase={selectedCase} selectedIncident={selectedIncident} selectedTab={tab} setSelectedCaseId={(id) => { setSelectedCaseId(id); setSelectedIncidentId(undefined); setTab("evidence"); }} setSelectedIncidentId={(id) => { setSelectedIncidentId(id); setSelectedCaseId(undefined); }} setTab={setTab} busyKey={busyKey} editingProposalId={editingProposalId} setEditingProposalId={setEditingProposalId} drafts={drafts} setDrafts={setDrafts} onApprove={approveProposal} onReject={rejectProposal} onInvestigate={(id) => void mutate(`investigate-${id}`, `/api/cases/${id}/investigate`, {})} onResolveIncident={(id) => void mutate(`resolve-${id}`, `/api/incidents/${id}/resolve`, {})} onResetDemo={resetDemo} />}
         {section === "approvals" && <ApprovalsView data={data} busyKey={busyKey} editingProposalId={editingProposalId} setEditingProposalId={setEditingProposalId} drafts={drafts} setDrafts={setDrafts} onApprove={approveProposal} onReject={rejectProposal} />}
         {section === "incidents" && <IncidentsView data={data} busyKey={busyKey} onResolve={(id) => void mutate(`resolve-${id}`, `/api/incidents/${id}/resolve`, {})} />}
         {section === "connections" && <ConnectionsView data={data} />}
@@ -192,8 +222,8 @@ export function MerchantShell({ section }: { section: Section }) {
         {section === "policies" && <PoliciesView data={data} draft={policyDraft} setDraft={setPolicyDraft} busyKey={busyKey} onSave={() => void mutate("policy", "/api/policies", policyDraft as Record<string, unknown>)} />}
       </div>
     </main>
-    <AgentOrb state={orbState} label={orbLabel} targetId={selectedCaseId || selectedIncidentId} onClick={() => setDrawerOpen((open) => !open)} open={drawerOpen} />
-    {drawerOpen && <AgentDrawer data={data} selectedCase={selectedCase} instruction={instruction} setInstruction={setInstruction} onSubmit={submitInstruction} onPause={() => selectedCaseId && void mutate(`pause-${selectedCaseId}`, `/api/cases/${selectedCaseId}/pause`, { reason: "Merchant paused outreach from agent controls" })} onClose={() => setDrawerOpen(false)} busy={busyKey === "instruction"} />}
+    <AgentOrb state={orbState} label={orbLabel} onClick={() => { if (drawerOpen) closeDrawer(); else setDrawerOpen(true); }} open={drawerOpen} />
+    {drawerOpen && <AgentDrawer data={data} selectedCase={selectedCase} messages={agentMessages} state={orbState} label={orbLabel} instruction={instruction} setInstruction={setInstruction} onSubmit={submitInstruction} onInvestigate={() => selectedCaseId && void mutate(`investigate-${selectedCaseId}`, `/api/cases/${selectedCaseId}/investigate`, {})} onPause={() => selectedCaseId && void mutate(`pause-${selectedCaseId}`, `/api/cases/${selectedCaseId}/pause`, { reason: "Merchant paused outreach from agent controls" })} onResume={() => selectedCaseId && void mutate(`resume-${selectedCaseId}`, `/api/cases/${selectedCaseId}/pause`, { reason: "Merchant resumed outreach from agent controls", resume: true })} onClose={closeDrawer} busy={busyKey === "instruction"} />}
   </div>;
 }
 
@@ -223,16 +253,13 @@ function RecoveryView(props: {
   onReject: (proposal: Proposal, recoveryCase?: CaseView) => Promise<void>;
   onInvestigate: (id: string) => void;
   onResolveIncident: (id: string) => void;
-  onInstructionSubmit: (event: FormEvent) => void;
-  instruction: string;
-  setInstruction: (value: string) => void;
   onResetDemo: () => void;
 }) {
   const { data, primaryCases, activeIncidents, selectedCase, selectedIncident } = props;
   const latestBatch = data.batchRuns[0];
   const batchActive = latestBatch && (latestBatch.status === "queued" || latestBatch.status === "running");
   return <>
-    {data.merchant.demo && <div className="demo-banner"><div><span className="demo-banner-kicker">Try Demo</span><strong>A private, resettable recovery workspace</strong><p>Evidence, approvals and simulated payments are isolated to this browser session. Nothing here moves real money.</p></div><button type="button" className="button small" onClick={props.onResetDemo}>Reset demo</button></div>}
+    {data.merchant.demo && <div className="demo-banner"><div><span className="demo-banner-kicker">Private demo</span><strong>A resettable recovery workspace</strong><p>Evidence, approvals and simulated payments are isolated to this browser session. Nothing here moves real money.</p></div><button type="button" className="button small" onClick={props.onResetDemo}>Reset demo</button></div>}
     <div className="section-intro"><div><h2>Review these cases</h2><p>Recover what you can within policy, and bring anything uncertain here.</p></div><span className="demo-note">{data.merchant.demo ? "Demo simulation · no real money" : `${data.capabilities.agent.label} · server selected`}</span></div>
     {batchActive && latestBatch && <div className="batch-progress" role="status"><span className="batch-progress-pulse" /><div><strong>{latestBatch.status === "queued" ? "Review request queued" : "Investigation in progress"}</strong><span>{latestBatch.completedCaseIds.length}/{latestBatch.caseIds.length} cases processed · the persistent worker owns evidence retrieval and proposals.</span></div></div>}
     <div className="workspace">
@@ -243,7 +270,11 @@ function RecoveryView(props: {
 }
 
 function CaseDetail(props: ComponentProps<typeof RecoveryView> & { recoveryCase: CaseView }) {
-  const { recoveryCase, selectedTab, setTab, editingProposalId, setEditingProposalId, drafts, setDrafts, onApprove, onReject, onInvestigate, busyKey, onInstructionSubmit, instruction, setInstruction } = props;
+  const { recoveryCase: requestedCase, selectedTab: requestedTab, setTab, editingProposalId, setEditingProposalId, drafts, setDrafts, onApprove, onReject, onInvestigate, busyKey } = props;
+  const visibleSignals = requestedCase.confidence === 0 && requestedCase.workflow === "invoice_resolution" ? requestedCase.signals.filter((signal) => signal.type !== "email_received") : requestedCase.signals;
+  const recoveryCase = visibleSignals === requestedCase.signals ? requestedCase : { ...requestedCase, signals: visibleSignals };
+  const hasRetrievedEvidence = recoveryCase.messages.length > 0 || recoveryCase.documents.length > 0;
+  const selectedTab = requestedTab === "messages" && !hasRetrievedEvidence ? "evidence" : requestedTab;
   const proposal = recoveryCase.proposals.find((item) => item.status === "pending") || recoveryCase.proposals[0];
   const draft = proposal ? drafts[proposal.id] : undefined;
   const latestInbound = recoveryCase.messages.find((item) => item.direction === "inbound");
@@ -252,18 +283,23 @@ function CaseDetail(props: ComponentProps<typeof RecoveryView> & { recoveryCase:
   const quote = recoveryCase.confidence === 0 ? "Evidence review is pending; no blocker has been classified yet." : recoveryCase.blocker === "missing_document" ? latestInbound?.body || "Finance is waiting for the signed delivery confirmation." : recoveryCase.blocker === "promise_to_pay" ? latestInbound?.body || "Payment was promised for Friday." : recoveryCase.blocker === "dispute" ? latestInbound?.body || "The customer has disputed the invoice." : "The earlier card authorization did not complete.";
   const beginEdit = () => { if (!proposal) return; setEditingProposalId(proposal.id); setDrafts((current) => ({ ...current, [proposal.id]: { subject: String(proposal.payload.subject || ""), body: String(proposal.payload.body || "") } })); };
   const toggleEdit = () => { if (!proposal) return; if (editingProposalId === proposal.id) { setEditingProposalId(null); return; } beginEdit(); };
-  return <section className="case-detail" aria-label={`Case details for ${recoveryCase.customer.displayName}`}>
+  return <section className={`case-detail ${recoveryCase.messages.length === 0 ? "no-messages" : ""} ${recoveryCase.documents.length === 0 ? "no-documents" : ""}`} aria-label={`Case details for ${recoveryCase.customer.displayName}`}>
     <div className="case-detail-header"><div className="case-identity"><span className="person-avatar">{initials(recoveryCase.customer.displayName)}</span><div><h2>{recoveryCase.customer.displayName}</h2><p>{recoveryCase.obligation.kind === "invoice" ? `Invoice ${recoveryCase.invoice?.invoiceNumber || recoveryCase.obligation.invoiceRef}` : "Ergonomic chair purchase"} · {recoveryCase.customer.email}</p></div></div><div className="case-amount"><strong>{formatMoney(outstanding, recoveryCase.obligation.currency)}</strong><span>outstanding · {formatMoney(recoveryCase.obligation.amountPaid, recoveryCase.obligation.currency)} paid</span></div></div>
     <CaseStatusLine recoveryCase={recoveryCase} />
-    <div className="detail-tabs" role="tablist" aria-label="Case information"><button type="button" className={`detail-tab ${selectedTab === "evidence" ? "active" : ""}`} onClick={() => setTab("evidence")} role="tab" aria-selected={selectedTab === "evidence"}>Overview</button><button type="button" className={`detail-tab ${selectedTab === "messages" ? "active" : ""}`} onClick={() => setTab("messages")} role="tab" aria-selected={selectedTab === "messages"}>Messages & documents</button><button type="button" className={`detail-tab ${selectedTab === "history" ? "active" : ""}`} onClick={() => setTab("history")} role="tab" aria-selected={selectedTab === "history"}>History</button></div>
+     <div className="detail-tabs" role="tablist" aria-label="Case information"><button type="button" className={`detail-tab ${selectedTab === "evidence" ? "active" : ""}`} onClick={() => setTab("evidence")} role="tab" aria-selected={selectedTab === "evidence"}>Overview</button>{hasRetrievedEvidence && <button type="button" className={`detail-tab ${selectedTab === "messages" ? "active" : ""}`} onClick={() => setTab("messages")} role="tab" aria-selected={selectedTab === "messages"}>Messages & documents</button>}<button type="button" className={`detail-tab ${selectedTab === "history" ? "active" : ""}`} onClick={() => setTab("history")} role="tab" aria-selected={selectedTab === "history"}>History</button></div>
       {selectedTab === "evidence" && <><div className="detail-section"><h3>{recoveryCase.confidence === 0 ? "Evidence review" : "What’s blocking this payment"}</h3><p className="blocker-quote">“{quote}”</p><div className="evidence-grid"><div className="evidence-item"><div className="evidence-item-label">Obligation</div><div className="evidence-item-value">{recoveryCase.obligation.orderRef || recoveryCase.obligation.invoiceRef}</div><div className="evidence-item-detail">{formatMoney(recoveryCase.obligation.amountDue, recoveryCase.obligation.currency)} due</div></div><div className="evidence-item"><div className="evidence-item-label">Identity confidence</div><div className="evidence-item-value">{recoveryCase.confidence > 0 ? `${Math.round(recoveryCase.confidence * 100)}% matched` : "Pending"}</div><div className="evidence-item-detail">{recoveryCase.confidence > 0 ? "Exact references preferred" : "Waiting for retrieved evidence"}</div></div><div className="evidence-item"><div className="evidence-item-label">Next action</div><div className="evidence-item-value">{recoveryCase.state === "awaiting_approval" ? "Merchant approval" : titleCase(recoveryCase.state)}</div><div className="evidence-item-detail">Policy enforced at execution</div></div></div><div className="source-list">{recoveryCase.paymentAttempt && <SourceChip label="Razorpay failure" type="webhook" />}{recoveryCase.signals?.map((signal) => <SourceChip key={signal.id} label={titleCase(signal.type)} type="source" />)}{latestInbound && <SourceChip label={`${latestInbound.providerMode === "fixture" ? "Fixture " : "Live "}Email thread`} type="email" href={latestInbound.providerUrl} />}{recoveryCase.documents.map((document) => <SourceChip key={document.id} label={`${document.providerMode === "fixture" ? "Fixture " : "Live "}delivery document`} type="document" href={`/api/documents/${document.id}?caseId=${encodeURIComponent(recoveryCase.id)}`} />)}</div></div><EvidencePath recoveryCase={recoveryCase} />{proposal && <ProposalBlock proposal={proposal} recoveryCase={recoveryCase} draft={draft} editing={editingProposalId === proposal.id} onEdit={toggleEdit} onDraftChange={(next) => setDrafts((current) => ({ ...current, [proposal.id]: next }))} onApprove={() => void onApprove(proposal, recoveryCase)} onReject={() => void onReject(proposal, recoveryCase)} busy={busyKey === `approve-${proposal.id}` || busyKey === `reject-${proposal.id}`} />}{paymentLink && <div className="payment-link-box"><span className="eyebrow">Customer payment page</span><p>{paymentLink.status === "paid" ? "Razorpay payment is verified." : "One Standard Payment Link is ready; customer authorization is still required."}</p><Link className="button link-button small" href={paymentLink.url} target="_blank" rel="noreferrer">{paymentLink.status === "paid" ? "View payment page" : "Open customer page"}<ArrowRight size={14} /></Link></div>}{!proposal && !paymentLink && recoveryCase.state !== "recovered" && <div className="next-action"><Sparkles size={16} /><div><strong>Investigate next</strong><span>Run a bounded evidence review before any customer-facing action.</span><button type="button" className="button small" onClick={() => onInvestigate(recoveryCase.id)} disabled={busyKey === `investigate-${recoveryCase.id}`} style={{ marginTop: 10 }}>{busyKey === `investigate-${recoveryCase.id}` ? "Investigating…" : "Investigate case"}</button></div></div>}</>}
     {selectedTab === "messages" && <div className="detail-section"><h3>Messages and permitted documents</h3><div className="message-list">{recoveryCase.messages.length === 0 ? <EmptyState title="No messages yet" detail="The customer has not shared an Email thread for this case." icon={Mail} /> : recoveryCase.messages.map((message) => <div className="message-item" key={message.id}><div className="message-top"><span>{message.direction === "inbound" ? "Inbound Email" : "Outbound Email"} · {message.providerMode || "provider"}</span><span>{formatDateTime(message.receivedAt || message.sentAt)}</span></div><div className="message-subject">{message.subject}</div><div className="message-provenance">{message.from || message.participants[0]} → {(message.to || message.participants.slice(1)).join(", ")} · thread {message.threadId || "not supplied"}{message.providerUrl && <> · <a href={message.providerUrl} target="_blank" rel="noreferrer">Open provider</a></>}</div><p className="message-body">{message.body}</p></div>)}</div><div style={{ marginTop: 20 }}><h3>Documents</h3>{recoveryCase.documents.length === 0 ? <p>No matching documents found.</p> : recoveryCase.documents.map((document) => <div className="document-row" key={document.id}><div className="document-name"><FileText size={15} /><span>{document.name}<small>{document.providerMode || "provider"} · {document.matchReason || "Scoped to this case"}</small></span></div><span className="document-permission">{document.permission === "approved_customer_share" ? "Share-safe" : "Merchant only"}</span><SourceChip label="Preview" type="document" href={`/api/documents/${document.id}?caseId=${encodeURIComponent(recoveryCase.id)}`} /></div>)}</div></div>}
     {selectedTab === "history" && <div className="detail-section"><h3>Case history</h3><div className="history-list">{recoveryCase.latestAudit.map((event) => <HistoryItem key={event.id} event={event} />)}</div></div>}
-      <form className="agent-composer" onSubmit={onInstructionSubmit}><label className="field-label" htmlFor="agent-instruction"><span>Agent instruction</span><div className="drawer-input-row"><input id="agent-instruction" className="text-input" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Ask the Rebound agent…" /><button type="submit" className="button primary" aria-label="Send instruction" disabled={!instruction.trim()}><Send size={15} /></button></div></label></form>
   </section>;
 }
 
 function EvidencePath({ recoveryCase }: { recoveryCase: CaseView }) {
+  if (recoveryCase.confidence === 0 && recoveryCase.workflow === "invoice_resolution") return <div className="evidence-pending" role="status"><span className="eyebrow">Evidence status</span><strong>External evidence not retrieved yet.</strong><p>Use the Rebound orb to review this case. Email and Drive records will appear only after retrieval.</p></div>;
+  if (recoveryCase.workflow === "failed_purchase") {
+    const paymentAttempt = recoveryCase.paymentAttempt;
+    const checkoutSignal = recoveryCase.signals.find((signal) => signal.type === "checkout_abandoned");
+    return <div className="evidence-path" aria-label="Purchase correlation evidence"><div className="evidence-path-heading"><span className="eyebrow">Purchase correlation</span><span className="demo-note">Facts first · one canonical purchase</span></div><div className="evidence-path-grid"><div className="path-step"><span className="path-index">1</span><div><span className="eyebrow">Razorpay payment</span><strong>{paymentAttempt?.status === "failed" ? "Authorization failed" : "No failed attempt attached"}</strong>{paymentAttempt && <><small>{paymentAttempt.razorpayPaymentId} · {formatMoney(paymentAttempt.amount, recoveryCase.obligation.currency)}</small><p>{paymentAttempt.errorDescription || "The attempt did not complete."}</p></>}</div></div><div className="path-step"><span className="path-index">2</span><div><span className="eyebrow">Checkout signal</span><strong>{checkoutSignal ? "Checkout abandoned" : "No abandonment signal attached"}</strong>{checkoutSignal && <><small>{checkoutSignal.externalId} · {formatDateTime(checkoutSignal.occurredAt)}</small><p>Same order, cart, customer and amount as the failed payment.</p></>}</div></div><div className="path-step"><span className="path-index">3</span><div><span className="eyebrow">Canonical purchase</span><strong>{recoveryCase.obligation.orderRef || "Purchase identity"}</strong><small>{recoveryCase.obligation.cartRef || "Matched cart"} · {recoveryCase.customer.email}</small><p>These signals are correlated into one recovery case; no customer message is required.</p></div></div></div></div>;
+  }
   if (recoveryCase.blocker !== "missing_document") return null;
   const inbound = recoveryCase.messages.find((item) => item.direction === "inbound");
   const document = recoveryCase.documents.find((item) => item.customerId === recoveryCase.customer.id && item.obligationId === recoveryCase.obligation.id && item.permission === "approved_customer_share");
@@ -330,26 +366,134 @@ function HistoryItem({ event }: { event: BootstrapPayload["audit"][number] }) {
   return <div className="history-item"><div className="history-top"><span>{event.actor} · {titleCase(event.eventType)}</span><span>{formatDateTime(event.createdAt)}</span></div><div className="message-body">{event.summary}</div>{event.demo && <span className="demo-note" style={{ marginTop: 7 }}>Demo simulation</span>}</div>;
 }
 
-function AgentDrawer({ data, selectedCase, instruction, setInstruction, onSubmit, onPause, onClose, busy }: { data: BootstrapPayload; selectedCase?: CaseView; instruction: string; setInstruction: (value: string) => void; onSubmit: (event: React.FormEvent) => void; onPause: () => void; onClose: () => void; busy: boolean }) {
-  return <>
-    <div className="agent-drawer-backdrop" onClick={onClose} aria-hidden="true" />
-    <aside className="agent-drawer" role="dialog" aria-modal="true" aria-labelledby="agent-drawer-title">
-      <div className="drawer-header"><div><h2 id="agent-drawer-title">Rebound agent</h2><p>Bounded evidence review · model proposes, code enforces.</p></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close Rebound agent"><X size={17} /></button></div>
-      <div className="drawer-body">
-        <div className="eyebrow">Current attention</div>
-        <div className="activity-line" style={{ marginTop: 15 }}><span className="activity-line-mark waiting" /><div className="activity-line-copy"><strong>{selectedCase?.customer.displayName || "Northstar Office"}</strong><br />{selectedCase ? selectedCase.nextAction : data.orb.label}</div></div>
-        {selectedCase && <><div className="eyebrow" style={{ marginTop: 9 }}>Scoped sources</div><div className="source-list" style={{ marginTop: 12 }}>
-          {selectedCase.paymentAttempt && <SourceChip label="Razorpay failure" type="webhook" />}
-          {selectedCase.signals.map((signal) => <SourceChip key={signal.id} label={titleCase(signal.type)} type="source" />)}
-          {selectedCase.messages.length > 0 && <SourceChip label="Email thread" type="email" />}
-          {selectedCase.documents.map((document) => <SourceChip key={document.id} label={`${document.providerMode === "fixture" ? "Fixture · " : ""}${document.name}`} type="document" href={`/api/documents/${document.id}?caseId=${encodeURIComponent(selectedCase.id)}`} />)}
-        </div></>}
-        <div className="eyebrow" style={{ marginTop: 18 }}>Recent activity</div>
-        <div style={{ marginTop: 15 }}>{data.audit.slice(0, 5).map((event) => <div className="activity-line" key={event.id}><span className={`activity-line-mark ${event.eventType.includes("verified") || event.eventType.includes("posted") ? "verified" : event.eventType.includes("paused") ? "waiting" : ""}`} /><div className="activity-line-copy">{event.summary}<br /><span style={{ color: "var(--text-3)", fontSize: 10 }}>{formatRelative(event.createdAt)}</span></div></div>)}</div>
-        {selectedCase && <div className="drawer-controls"><h3>Case controls</h3><button type="button" className="button full" onClick={onPause} disabled={selectedCase.state === "paused"}><Pause size={14} />Pause outreach</button></div>}
-        <div className="drawer-controls"><h3>Tell the agent what matters</h3><form onSubmit={onSubmit}><div className="drawer-input-row"><input className="text-input" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Ask the Rebound agent…" aria-label="Agent instruction" /><button type="submit" className="button primary" disabled={!instruction.trim() || busy} aria-label="Submit agent instruction">{busy ? <RefreshCcw size={15} className="spin" /> : <Send size={15} />}</button></div></form></div>
-      </div>
-      <div className="drawer-footer"><span className="demo-note">{data.mode === "fixture" ? "Demo simulation · no real money" : "Live guardrails active"}</span><small>Payment success is never inferred here. Only a signed, persisted and verified Razorpay event may recover money.</small></div>
-    </aside>
-  </>;
+interface AgentDrawerProps {
+  data: BootstrapPayload;
+  selectedCase?: CaseView;
+  messages: AgentMessage[];
+  state: OrbState;
+  label: string;
+  instruction: string;
+  setInstruction: (value: string) => void;
+  onSubmit: (event: FormEvent) => void;
+  onInvestigate: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onClose: () => void;
+  busy: boolean;
+}
+
+interface PanelDragSession {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  startPosition: FloatingPosition;
+}
+
+const AGENT_PANEL_BOTTOM_GAP = FLOATING_INSET;
+
+function AgentDrawer({ data, selectedCase, messages, state, label, instruction, setInstruction, onSubmit, onInvestigate, onPause, onResume, onClose, busy }: AgentDrawerProps) {
+  const prompts = selectedCase ? [`What is blocking ${selectedCase.customer.displayName}?`, "Explain the current evidence and status."] : ["How many issues do we have?", "Which customers are affected?", "Summarize the highest-priority cases."];
+  const panelRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dragRef = useRef<PanelDragSession | null>(null);
+  const positionRef = useRef<FloatingPosition | null>(null);
+  const [position, setPosition] = useState<FloatingPosition | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const setPanelPosition = useCallback((next: FloatingPosition) => {
+    positionRef.current = next;
+    setPosition(next);
+  }, []);
+
+  useLayoutEffect(() => {
+    const placePanel = () => {
+      const rect = panelRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const preferred = positionRef.current || {
+        x: window.innerWidth - rect.width - FLOATING_INSET,
+        y: window.innerHeight - rect.height - AGENT_PANEL_BOTTOM_GAP
+      };
+      setPanelPosition(findSafeFloatingPosition(preferred, { width: rect.width, height: rect.height }, { ignoreSelectors: [".agent-drawer"] }));
+    };
+
+    placePanel();
+    window.addEventListener("resize", placePanel);
+    return () => window.removeEventListener("resize", placePanel);
+  }, [setPanelPosition]);
+
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
+
+  const panelSize = () => {
+    const rect = panelRef.current?.getBoundingClientRect();
+    return rect ? { width: rect.width, height: rect.height } : { width: 360, height: 520 };
+  };
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const rect = panelRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startPosition: positionRef.current || { x: rect.left, y: rect.top } };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+    setDragging(true);
+  };
+
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const next = { x: drag.startPosition.x + event.clientX - drag.startX, y: drag.startPosition.y + event.clientY - drag.startY };
+    const size = panelSize();
+    setPanelPosition(findSafeFloatingPosition(next, size, { ignoreSelectors: [".agent-drawer"] }));
+  };
+
+  const finishPointerDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    setDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 48 : 16;
+    const delta = event.key === "ArrowUp" ? { x: 0, y: -step }
+      : event.key === "ArrowDown" ? { x: 0, y: step }
+        : event.key === "ArrowLeft" ? { x: -step, y: 0 }
+          : event.key === "ArrowRight" ? { x: step, y: 0 }
+            : null;
+    if (!delta) return;
+    event.preventDefault();
+    const rect = panelRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const current = positionRef.current || { x: rect.left, y: rect.top };
+    setPanelPosition(findSafeFloatingPosition({ x: current.x + delta.x, y: current.y + delta.y }, panelSize(), { ignoreSelectors: [".agent-drawer"] }));
+  };
+
+  const attentionTone = state === "success" ? "verified" : state === "approval" || state === "paused" || state === "inspecting" || state === "working" ? "waiting" : state === "uncertain" || state === "error" ? "failed" : "";
+  const panelStyle = position ? { "--agent-panel-x": `${position.x}px`, "--agent-panel-y": `${position.y}px` } as CSSProperties : undefined;
+
+  return <aside ref={panelRef} id="agent-drawer" className={`agent-drawer ${position ? "is-positioned" : ""} ${dragging ? "dragging" : ""}`} style={panelStyle} role="dialog" aria-labelledby="agent-drawer-title" aria-describedby="agent-drawer-description">
+    <div className="drawer-header" tabIndex={0} role="group" aria-label="Move Rebound agent panel. Use arrow keys to move." onKeyDown={handleKeyDown} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={finishPointerDrag} onPointerCancel={finishPointerDrag}>
+      <div className="drawer-heading"><span className="drawer-drag-grip" aria-hidden="true">⠿</span><div><h2 id="agent-drawer-title">Rebound agent</h2><p id="agent-drawer-description">Bounded evidence review · model proposes, code enforces.</p><div className={`drawer-state ${state}`} role="status" aria-live="polite"><span aria-hidden="true" />{label}</div></div></div>
+      <button type="button" className="icon-button" onPointerDown={(event) => event.stopPropagation()} onClick={onClose} aria-label="Close Rebound agent"><X size={17} /></button>
+    </div>
+    <div className="drawer-body">
+      <div className="eyebrow">Current attention</div>
+      <div className="activity-line" style={{ marginTop: 15 }}><span className={`activity-line-mark ${attentionTone}`} /><div className="activity-line-copy"><strong>{selectedCase?.customer.displayName || "Northstar Office"}</strong><br />{selectedCase ? selectedCase.nextAction : label}</div></div>
+      {selectedCase && <><div className="eyebrow" style={{ marginTop: 9 }}>Scoped sources</div><div className="source-list" style={{ marginTop: 12 }}>
+        {selectedCase.paymentAttempt && <SourceChip label="Razorpay failure" type="webhook" />}
+        {selectedCase.signals.map((signal) => <SourceChip key={signal.id} label={titleCase(signal.type)} type="source" />)}
+        {selectedCase.messages.length > 0 && <SourceChip label="Email thread" type="email" />}
+        {selectedCase.documents.map((document) => <SourceChip key={document.id} label={`${document.providerMode === "fixture" ? "Fixture · " : ""}${document.name}`} type="document" href={`/api/documents/${document.id}?caseId=${encodeURIComponent(selectedCase.id)}`} />)}
+      </div></>}
+      <div className="eyebrow" style={{ marginTop: 18 }}>Recent activity</div>
+      <div style={{ marginTop: 15 }}>{data.audit.slice(0, 5).map((event) => <div className="activity-line" key={event.id}><span className={`activity-line-mark ${event.eventType.includes("verified") || event.eventType.includes("posted") ? "verified" : event.eventType.includes("paused") ? "waiting" : ""}`} /><div className="activity-line-copy">{event.summary}<br /><span style={{ color: "var(--text-3)", fontSize: 10 }}>{formatRelative(event.createdAt)}</span></div></div>)}</div>
+      {selectedCase && <div className="drawer-controls"><h3>Case controls</h3><div className="drawer-control-grid"><button type="button" className="button full" onClick={onInvestigate} disabled={busy || selectedCase.state === "recovered"}><Search size={14} />Review evidence</button><button type="button" className="button full" onClick={selectedCase.state === "paused" ? onResume : onPause} disabled={busy || ["recovered", "closed"].includes(selectedCase.state)}><Pause size={14} />{selectedCase.state === "paused" ? "Resume outreach" : "Pause outreach"}</button></div></div>}
+      <div className="drawer-controls"><h3>Bounded requests</h3><p className="drawer-help">Ask about current workspace state or request an implemented case review. External actions still require approval.</p><div className="agent-prompts">{prompts.map((prompt) => <button type="button" className="agent-prompt" key={prompt} onClick={() => setInstruction(prompt)}>{prompt}</button>)}</div><form onSubmit={onSubmit}><label className="sr-only" htmlFor="agent-instruction">Bounded agent request</label><div className="drawer-input-row"><input id="agent-instruction" className="text-input" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Ask about this workspace…" aria-label="Bounded agent request" /><button type="submit" className="button primary" disabled={!instruction.trim() || busy} aria-label="Submit agent request">{busy ? <RefreshCcw size={15} className="spin" /> : <Send size={15} />}</button></div></form></div>
+      {messages.length > 0 && <div className="agent-transcript" aria-live="polite">{messages.slice(-8).map((message) => <div className={`agent-message ${message.role}`} key={message.id}><span className="agent-message-role">{message.role === "user" ? "You" : "Rebound"}</span><p>{message.text}</p></div>)}</div>}
+    </div>
+    <div className="drawer-footer"><span className="demo-note">{data.mode === "fixture" ? "Demo simulation · no real money" : "Live guardrails active"}</span><small>Payment success is never inferred here. Only a signed, persisted and verified Razorpay event may recover money.</small></div>
+  </aside>;
 }
