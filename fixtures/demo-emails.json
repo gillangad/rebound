@@ -1,0 +1,23 @@
+[
+  {
+    "providerId": "fixture-thread-atelier-1",
+    "subject": "Re: Invoice NSO-INV-2048 — delivery confirmation needed",
+    "from": "priya@atelierworks.example",
+    "body": "Hi Northstar team, our finance team cannot release payment for the 30 desks until you share the signed delivery confirmation. Once received, we can process the invoice.",
+    "receivedAt": "2026-09-04T08:10:00.000Z"
+  },
+  {
+    "providerId": "fixture-thread-brightline-1",
+    "subject": "Payment timing for INV-2039",
+    "from": "finance@brightlinestudio.example",
+    "body": "We have queued the ₹72,000 payment for Friday. Please do not follow up before then.",
+    "receivedAt": "2026-09-04T06:40:00.000Z"
+  },
+  {
+    "providerId": "fixture-thread-dispute-1",
+    "subject": "Dispute: INV-2017 quantity mismatch",
+    "from": "ops@orbitretail.example",
+    "body": "We dispute the outstanding invoice because two desks were not on the delivery receipt. Please pause collection while we reconcile.",
+    "receivedAt": "2026-09-03T11:05:00.000Z"
+  }
+]

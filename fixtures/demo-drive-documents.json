@@ -1,0 +1,16 @@
+[
+  {
+    "providerId": "fixture-drive-nw-delivery-atelier",
+    "name": "NW-DELIVERY-ATELIER-30-DESKS.txt",
+    "mimeType": "text/plain",
+    "sourceUrl": "/fixtures/atelier-delivery-confirmation.txt",
+    "extractedText": "Invoice: NSO-INV-2048\nOrder: NSO-PO-8831\nCustomer: Atelier Works Pvt Ltd\nGoods: 30 standing desks, walnut finish\nDelivered: 28 August 2026\nReceived by: Priya Menon, Finance Manager\nSignature status: Signed and verified by Northstar Office operations"
+  },
+  {
+    "providerId": "fixture-drive-nw-delivery-lumen",
+    "name": "NW-DELIVERY-LUMEN-12-DESKS.txt",
+    "mimeType": "text/plain",
+    "sourceUrl": "/fixtures/lumen-delivery-confirmation.txt",
+    "extractedText": "Invoice: NSO-INV-2012\nOrder: NSO-PO-7712\nCustomer: Lumen & Co\nGoods: 12 standing desks\nSignature status: Signed"
+  }
+]

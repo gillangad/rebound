@@ -1,0 +1,12 @@
+NORTHSTAR OFFICE
+SIGNED DELIVERY CONFIRMATION
+
+Invoice: NSO-INV-2048
+Order: NSO-PO-8831
+Customer: Atelier Works Pvt Ltd
+Goods: 30 standing desks, walnut finish
+Delivered: 28 August 2026
+Received by: Priya Menon, Finance Manager
+Signature status: Signed and verified by Northstar Office operations
+
+This fixture document is provided only for the Northstar Office demo. It must not be shared with another customer.

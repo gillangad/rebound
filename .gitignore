@@ -1,0 +1,19 @@
+node_modules/
+.next/
+.next-build-cache-stale/
+out/
+playwright-report/
+test-results/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+*.log
+data/
+
+# Private product direction, design notes, and future planning documents.
+project-planning/
+
+# Internal visual research and generated local evaluation artifacts.
+design-assets/
+evaluation-runs/

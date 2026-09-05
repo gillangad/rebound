@@ -1,0 +1,39 @@
+services:
+  - type: worker
+    name: rebound-worker
+    runtime: node
+    buildCommand: npm ci
+    startCommand: npm run db:migrate && npm run worker:prod
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: AGENT_PROVIDER
+        sync: false
+      - key: EVIDENCE_PROVIDER
+        sync: false
+      - key: PAYMENT_PROVIDER
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DEMO_SESSION_SECRET
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+      - key: FIREWORKS_API_KEY
+        sync: false
+      - key: FIREWORKS_MODEL
+        sync: false
+      - key: CODEX_APP_SERVER_URL
+        sync: false
+      - key: CODEX_APP_SERVER_COMMAND
+        sync: false
+      - key: GOOGLE_ACCESS_TOKEN
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
