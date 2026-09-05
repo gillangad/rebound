@@ -1,8 +1,7 @@
-let counter = 0;
+import { randomUUID } from "node:crypto";
 
-export function newId(prefix = "id") {
-  counter += 1;
-  return `${prefix}_${Date.now().toString(36)}_${counter.toString(36)}`;
+export function newId(_prefix = "id") {
+  return randomUUID();
 }
 
 export function stableUuid(seed: number) {
