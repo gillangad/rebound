@@ -17,3 +17,6 @@ project-planning/
 # Internal visual research and generated local evaluation artifacts.
 design-assets/
 evaluation-runs/
+
+.vercel
+.env*

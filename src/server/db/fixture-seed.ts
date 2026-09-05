@@ -133,6 +133,7 @@ function namespaceWorld(world: DemoWorld, workspaceId: string) {
   const idMap = new Map<string, string>();
   const register = (value: string) => { if (!idMap.has(value)) idMap.set(value, namespacedId(value, workspaceId)); };
   register(world.merchant.id);
+  register(world.policy.id);
   for (const collection of [world.customers, world.obligations, world.cases, world.signals, world.paymentAttempts, world.paymentLinks, world.payments, world.invoices, world.messages, world.documents, world.incidents, world.proposals, world.approvals, world.jobs, world.ledger, world.audit, world.agentRuns, world.connectors, world.webhookReceipts, world.instructions, world.batchRuns]) for (const item of collection) register(item.id);
   const remap = (value: unknown): unknown => {
     if (typeof value === "string") return idMap.get(value) || value;
