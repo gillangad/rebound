@@ -6,6 +6,7 @@ import demoDriveDocuments from "../../../fixtures/demo-drive-documents.json";
 import { DEMO_CLOCK, PRODUCT_NAME } from "@/shared/constants";
 import type {
   AuditEvent,
+  AgentProvider,
   AgentInvocationReason,
   BatchRun,
   BootstrapPayload,
@@ -25,7 +26,7 @@ import type {
   RecoveryCase,
   WebhookReceipt
 } from "@/shared/types";
-import { formatMoney, titleCase } from "@/shared/formatters";
+import { formatMoney } from "@/shared/formatters";
 import { evaluateProposal, isOrdinaryChasingEligible, nextContactWindowStart, type ProposalInput } from "@/server/domain/policy";
 import { correlateSignal } from "@/server/domain/correlation";
 import { resolveRelativeContactTime } from "@/server/domain/dates";
@@ -39,8 +40,8 @@ import { replaceNormalizedWorld } from "@/server/db/relational-sync";
 import { decryptToken, FixtureDriveAdapter, FixtureEmailAdapter, GoogleDriveAdapter, GoogleEmailAdapter, type DriveAdapter, type EmailAdapter } from "@/server/integrations/google";
 import { getRazorpayAdapter } from "@/server/integrations/razorpay";
 import type { AgentRun } from "@/shared/types";
-import type { RecoveryToolContext } from "@/server/agent/tools";
-import { runRecoveryAgent } from "@/server/agent/agent";
+import type { RecoveryChatToolContext, RecoveryToolContext } from "@/server/agent/tools";
+import { runRecoveryAgent, runRecoveryChat, type AgentChatResult, type ChatInvocationInput } from "@/server/agent/agent";
 
 export type RepositoryErrorCode =
   | "NOT_FOUND"
@@ -52,6 +53,7 @@ export type RepositoryErrorCode =
   | "DATABASE_REQUIRED"
   | "WORKSPACE_REQUIRED"
   | "PROVIDER_MISMATCH"
+  | "AGENT_PROVIDER_FAILED"
   | "ALREADY_DONE";
 
 export class RepositoryError extends Error {
@@ -102,7 +104,7 @@ export interface RecoveryRepository {
   investigateCase(caseId: string, invocationReason?: AgentInvocationReason): Promise<{ runId: string; proposal?: Proposal; skipped?: boolean }>;
   pauseCase(caseId: string, reason: string, pauseUntil?: string): Promise<RecoveryCase>;
   resumeCase(caseId: string): Promise<RecoveryCase>;
-  submitInstruction(caseId: string | undefined, instruction: string): Promise<{ case?: RecoveryCase; message: string; batchRun?: BatchRun }>;
+  submitInstruction(caseId: string | undefined, instruction: string): Promise<{ case?: RecoveryCase; message: string; batchRun?: BatchRun; agent?: { runId: string; provider: AgentProvider; model: string; toolCallSummaries: string[]; status: "completed" | "deduplicated" } }>;
   resolveIncident(incidentId: string): Promise<{ incident: Incident; eligibleCaseIds: string[]; excludedCaseIds: string[] }>;
   updatePolicy(input: Partial<Pick<Policy, "reviewFirst" | "allowedChannels" | "contactStartHour" | "contactEndHour" | "timezone" | "maxAttempts" | "minimumSpacingHours" | "discountsAllowed" | "incidentSuppression">>): Promise<Policy>;
   verifyFixturePayment(publicToken: string, amount?: number): Promise<PaymentOutcome>;
@@ -173,11 +175,6 @@ function isGreeting(instruction: string) {
   return /^(hi|hello|hey|good morning|good afternoon|good evening)[!. ]*$/i.test(instruction.trim());
 }
 
-function isWorkspaceQuestion(instruction: string) {
-  const lower = instruction.toLowerCase();
-  return isGreeting(instruction) || /how many (issues|cases|problems)|which customers? .*affected|who .*affected|highest[- ]priority|summari[sz]e .*cases|workspace summary|what('?s| is) happening/.test(lower);
-}
-
 function outstandingFor(world: DemoWorld, recoveryCase: RecoveryCase) {
   const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
   return obligation ? Math.max(0, obligation.amountDue - obligation.amountPaid) : 0;
@@ -187,62 +184,69 @@ function customerFor(world: DemoWorld, recoveryCase: RecoveryCase) {
   return world.customers.find((item) => item.id === recoveryCase.customerId);
 }
 
-function answerWorkspaceQuestion(world: DemoWorld, instruction: string) {
-  if (isGreeting(instruction)) return "Hi — I’m Rebound. I can summarize this workspace, explain a selected case, review evidence, or pause/resume outreach where the policy allows it. External actions remain approval-gated.";
-  const openCases = world.cases.filter((item) => item.state !== "closed" && outstandingFor(world, item) > 0);
-  const pendingApprovals = world.proposals.filter((item) => item.status === "pending").length;
-  const pausedCases = openCases.filter((item) => item.state === "paused").length;
-  const affectedCustomers = [...new Set(openCases.map((item) => customerFor(world, item)?.displayName).filter((name): name is string => Boolean(name)))];
+function isBatchReviewRequest(instruction: string) {
   const lower = instruction.toLowerCase();
-  if (/how many (issues|cases|problems)/.test(lower)) return `There are ${openCases.length} open recovery issues across ${affectedCustomers.length} customers. ${pendingApprovals} await merchant approval and ${pausedCases} are paused by policy or incident controls.`;
-  if (/which customers? .*affected|who .*affected/.test(lower)) return affectedCustomers.length > 0 ? `Affected customers: ${affectedCustomers.join(", ")}. Rebound keeps their evidence and next action scoped to each obligation.` : "No customers currently have an outstanding recovery issue.";
-  if (/highest[- ]priority|summari[sz]e .*cases/.test(lower)) {
-    const priorityRank = { high: 0, medium: 1, low: 2 } as const;
-    const highest = openCases.slice().sort((left, right) => priorityRank[left.priority] - priorityRank[right.priority] || outstandingFor(world, right) - outstandingFor(world, left)).slice(0, 4);
-    const summary = highest.map((item) => `${customerFor(world, item)?.displayName || "Unknown customer"} — ${item.confidence === 0 ? "evidence review pending" : item.reason}`).join("; ");
-    return summary ? `Highest-priority cases: ${summary}.` : "There are no outstanding cases to summarize.";
-  }
-  return `I can answer “How many issues do we have?”, “Which customers are affected?”, or “Summarize the highest-priority cases.” Select a case for evidence, investigation, pause, or resume controls.`;
-}
-
-function answerCaseQuestion(world: DemoWorld, recoveryCase: RecoveryCase) {
-  const customer = customerFor(world, recoveryCase);
-  const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
-  const signals = world.signals.filter((item) => item.caseId === recoveryCase.id || item.obligationId === recoveryCase.obligationId);
-  const paymentAttempt = world.paymentAttempts.find((item) => item.obligationId === recoveryCase.obligationId);
-  const inbound = world.messages.find((item) => (item.caseId === recoveryCase.id || item.obligationId === recoveryCase.obligationId) && item.direction === "inbound");
-  const documents = world.documents.filter((item) => item.customerId === recoveryCase.customerId && item.obligationId === recoveryCase.obligationId);
-  const name = customer?.displayName || "This case";
-  if (recoveryCase.confidence === 0 && recoveryCase.workflow === "invoice_resolution") return `${name} is awaiting an evidence review. External evidence not retrieved yet; no blocker has been classified. Use Review evidence to retrieve the scoped Email and Drive records.`;
-  const evidence: string[] = [];
-  if (paymentAttempt?.status === "failed") evidence.push(`a failed Razorpay ${paymentAttempt.method} authorization${paymentAttempt.errorDescription ? ` (${paymentAttempt.errorDescription})` : ""}`);
-  if (signals.some((item) => item.type === "checkout_abandoned")) evidence.push("an abandoned-checkout signal");
-  if (inbound) evidence.push("one retrieved customer Email");
-  if (documents.length > 0) evidence.push(`the matched document ${documents[0].name}`);
-  if (recoveryCase.workflow === "failed_purchase" && paymentAttempt && signals.some((item) => item.type === "checkout_abandoned")) evidence.push(`both signals are correlated to one canonical purchase (${obligation?.orderRef || "order reference"})`);
-  const blocker = recoveryCase.confidence === 0 || recoveryCase.blocker === "no_response" ? "no blocker has been classified yet" : titleCase(recoveryCase.blocker).toLowerCase();
-  const evidenceText = evidence.length > 0 ? ` Evidence: ${evidence.join("; ")}.` : " No external evidence is attached to this case.";
-  return `${name} is ${titleCase(recoveryCase.state).toLowerCase()}. Current blocker: ${blocker}.${evidenceText} Next action: ${recoveryCase.nextAction}.`;
-}
-
-function findInstructionCase(world: DemoWorld, caseId: string | undefined, instruction: string) {
-  if (caseId) return world.cases.find((item) => item.id === caseId);
-  const lower = instruction.toLowerCase();
-  return world.cases.find((item) => {
-    const customer = customerFor(world, item);
-    return Boolean(customer && (lower.includes(customer.displayName.toLowerCase()) || (customer.company && lower.includes(customer.company.toLowerCase()))));
-  });
+  return lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
 }
 
 function instructionWrites(caseId: string | undefined, instruction: string) {
-  const lower = instruction.toLowerCase();
-  if (isWorkspaceQuestion(instruction) && !lower.includes("review these cases")) return false;
-  if (!caseId) return lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
-  if (/what .*block|blocking|current evidence|case status|explain .*status|explain .*evidence|why .*stuck|what happened/.test(lower)) return false;
-  if (/(^|\b)(unpause|resume|reopen)(\b|$)|resume outreach|continue outreach/.test(lower)) return true;
-  if (/\b(pause|stop outreach|do not contact|don't contact|investigate|review|retrieve|look into|find the blocker|run an evidence)\b/.test(lower)) return true;
-  return false;
+  void caseId;
+  return !isGreeting(instruction);
 }
+
+function canonicalChatInputHash(world: DemoWorld, prompt: string, selectedCaseId: string | undefined) {
+  const stable = {
+    prompt: prompt.trim(),
+    selectedCaseId,
+    provider: world.merchant.agentProvider || runtimeConfig().agentProvider,
+    policyVersion: world.policy.version,
+    cases: world.cases.map((recoveryCase) => ({ id: recoveryCase.id, customerId: recoveryCase.customerId, obligationId: recoveryCase.obligationId, workflow: recoveryCase.workflow, state: recoveryCase.state, priority: recoveryCase.priority, blocker: recoveryCase.blocker, confidence: recoveryCase.confidence, nextAction: recoveryCase.nextAction, pauseUntil: recoveryCase.pauseUntil })).sort((left, right) => left.id.localeCompare(right.id)),
+    obligations: world.obligations.map((obligation) => ({ id: obligation.id, amountDue: obligation.amountDue, amountPaid: obligation.amountPaid, status: obligation.status, currency: obligation.currency })).sort((left, right) => left.id.localeCompare(right.id)),
+    evidence: { messages: world.messages.map((message) => ({ id: message.id, providerId: message.providerId, caseId: message.caseId, obligationId: message.obligationId, body: message.body })).sort((left, right) => left.id.localeCompare(right.id)), documents: world.documents.map((document) => ({ id: document.id, providerId: document.providerId, customerId: document.customerId, obligationId: document.obligationId, checksum: document.checksum })).sort((left, right) => left.id.localeCompare(right.id)) }
+  };
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
+}
+
+function compactWorkspaceCase(world: DemoWorld, recoveryCase: RecoveryCase) {
+  const customer = customerFor(world, recoveryCase);
+  const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
+  return {
+    id: recoveryCase.id,
+    customer: customer ? { id: customer.id, displayName: customer.displayName, type: customer.type } : undefined,
+    workflow: recoveryCase.workflow,
+    state: recoveryCase.state,
+    priority: recoveryCase.priority,
+    blocker: recoveryCase.blocker,
+    confidence: recoveryCase.confidence,
+    outstandingAmount: obligation ? Math.max(0, obligation.amountDue - obligation.amountPaid) : 0,
+    currency: obligation?.currency,
+    reason: recoveryCase.reason,
+    nextAction: recoveryCase.nextAction,
+    pauseUntil: recoveryCase.pauseUntil
+  };
+}
+
+function workspaceChatSummary(world: DemoWorld) {
+  const openCases = world.cases.filter((item) => item.state !== "closed" && outstandingFor(world, item) > 0);
+  const customerNames = [...new Set(openCases.map((item) => customerFor(world, item)?.displayName).filter((name): name is string => Boolean(name)))];
+  return {
+    merchant: { id: world.merchant.id, name: world.merchant.name, timezone: world.merchant.timezone, defaultCurrency: world.merchant.defaultCurrency },
+    openCaseCount: openCases.length,
+    affectedCustomerCount: customerNames.length,
+    affectedCustomers: customerNames,
+    outstandingAmount: openCases.reduce((total, item) => total + outstandingFor(world, item), 0),
+    pendingApprovalCount: world.proposals.filter((item) => item.status === "pending").length,
+    activeIncidentCount: world.incidents.filter((item) => item.status === "active").length,
+    pausedCaseCount: openCases.filter((item) => item.state === "paused").length,
+    demo: world.merchant.mode === "fixture"
+  };
+}
+
+type AgentChatResponse = {
+  case?: RecoveryCase;
+  message: string;
+  agent: { runId: string; provider: AgentProvider; model: string; toolCallSummaries: string[]; status: "completed" | "deduplicated" };
+};
 
 function canonicalAgentInputHash(world: DemoWorld, recoveryCase: RecoveryCase, clock: () => Date) {
   const obligation = world.obligations.find((item) => item.id === recoveryCase.obligationId);
@@ -287,6 +291,7 @@ export class MemoryRepository implements RecoveryRepository {
   public world: DemoWorld;
   private readonly clock: () => Date;
   private readonly fixtureAsync: boolean;
+  private readonly chatInFlight = new Map<string, Promise<AgentChatResponse>>();
 
   constructor(world = createDemoWorld(), clock?: () => Date, options: { fixtureAsync?: boolean } = {}) {
     const legacyWorld = world as unknown as Record<string, unknown>;
@@ -487,8 +492,11 @@ export class MemoryRepository implements RecoveryRepository {
     });
     const activeCase = this.world.cases.find((item) => item.primary && item.state !== "closed") || this.world.cases[0];
     let orb: BootstrapPayload["orb"] = { state: "idle", label: "Agent idle", updatedAt: nowIso() };
+    const latestChatRun = this.world.agentRuns.find((run) => run.invocationReason === "explicit_chat");
     const activeInvestigationJob = this.world.jobs.find((job) => job.kind === "investigate_case" && ["queued", "running"].includes(job.status));
-    if (activeInvestigationJob?.status === "queued") orb = { state: "inspecting", label: "Investigation queued", caseId: activeInvestigationJob.caseId, updatedAt: nowIso() };
+    if (latestChatRun?.status === "running") orb = { state: "working", label: "Agent is thinking", caseId: latestChatRun.caseId, updatedAt: latestChatRun.startedAt };
+    else if (latestChatRun?.status === "failed") orb = { state: "error", label: "Provider needs attention", caseId: latestChatRun.caseId, updatedAt: latestChatRun.finishedAt || nowIso() };
+    else if (activeInvestigationJob?.status === "queued") orb = { state: "inspecting", label: "Investigation queued", caseId: activeInvestigationJob.caseId, updatedAt: nowIso() };
     else if (activeInvestigationJob?.status === "running") orb = { state: "working", label: "Retrieving evidence", caseId: activeInvestigationJob.caseId, updatedAt: nowIso() };
     else if (activeCase?.state === "awaiting_approval") orb = { state: "approval", label: "Approval required", caseId: activeCase.id, updatedAt: activeCase.updatedAt };
     else if (activeCase?.state === "paused") orb = { state: "paused", label: "Outreach paused", caseId: activeCase.id, updatedAt: activeCase.updatedAt };
@@ -519,6 +527,88 @@ export class MemoryRepository implements RecoveryRepository {
   async getCaseView(caseId: string) {
     const recoveryCase = this.world.cases.find((item) => item.id === caseId);
     return recoveryCase ? makeCaseView(this.world, recoveryCase) : null;
+  }
+
+  protected chatToolContext(modelRunId: string): RecoveryChatToolContext {
+    const scopedView = async (caseId: string) => {
+      const view = await this.getCaseView(caseId);
+      if (!view) throw new RepositoryError("NOT_FOUND", "Recovery case not found in this merchant workspace.");
+      return view;
+    };
+    return {
+      readWorkspaceSummary: async () => workspaceChatSummary(this.world),
+      readWorkspaceCases: async () => this.world.cases.map((recoveryCase) => compactWorkspaceCase(this.world, recoveryCase)),
+      readHistory: async (filter) => {
+        const normalized = filter?.trim().toLowerCase();
+        return this.world.audit.filter((event) => !normalized || `${event.eventType} ${event.entityId} ${event.summary}`.toLowerCase().includes(normalized)).slice(0, 20);
+      },
+      readCaseSummary: scopedView,
+      readPaymentFailure: async (caseId) => {
+        const view = await scopedView(caseId);
+        return view.paymentAttempt ? { id: view.paymentAttempt.id, providerPaymentId: view.paymentAttempt.razorpayPaymentId, amount: view.paymentAttempt.amount, status: view.paymentAttempt.status, errorCode: view.paymentAttempt.errorCode, errorDescription: view.paymentAttempt.errorDescription, errorSource: view.paymentAttempt.errorSource, errorStep: view.paymentAttempt.errorStep } : { status: "no_attempt_recorded" };
+      },
+      findRelatedSignals: async (caseId) => {
+        const view = await scopedView(caseId);
+        return view.signals.map((signal) => ({ id: signal.id, type: signal.type, source: signal.source, externalId: signal.externalId, payload: signal.payload, occurredAt: signal.occurredAt, correlationStatus: signal.correlationStatus }));
+      },
+      searchCustomerMessages: async (caseId, query) => {
+        const view = await scopedView(caseId);
+        const normalized = query?.trim().toLowerCase();
+        return view.messages.filter((message) => !normalized || `${message.subject} ${message.body}`.toLowerCase().includes(normalized)).map((message) => ({ id: message.id, direction: message.direction, subject: message.subject, body: message.body.slice(0, 2000), participants: message.participants, receivedAt: message.receivedAt, sentAt: message.sentAt, providerMode: message.providerMode }));
+      },
+      searchCaseDocuments: async (caseId, query) => {
+        const view = await scopedView(caseId);
+        const normalized = query?.trim().toLowerCase();
+        return view.documents.filter((document) => document.customerId === view.customer.id && document.obligationId === view.obligation.id && (!normalized || `${document.name} ${document.extractedText}`.toLowerCase().includes(normalized))).map((document) => ({ id: document.id, name: document.name, mimeType: document.mimeType, permission: document.permission, extractedText: document.extractedText.slice(0, 2500), checksum: document.checksum, providerMode: document.providerMode }));
+      },
+      readActivePolicies: async (caseId) => { await scopedView(caseId); return this.world.policy; },
+      readIncidentContext: async (caseId) => {
+        const view = await scopedView(caseId);
+        return view.incident ? { id: view.incident.id, provider: view.incident.provider, method: view.incident.method, confirmation: view.incident.confirmation, status: view.incident.status, summary: view.incident.summary, evidence: view.incident.evidence } : { status: "no_incident" };
+      },
+      createProposal: (input) => this.createAgentProposal(input, modelRunId),
+      requestInvestigation: async (caseId) => this.requestCaseInvestigation(caseId),
+      pauseOutreach: async (caseId, reason, pauseUntil) => this.pauseCase(caseId, reason, pauseUntil),
+      resumeOutreach: async (caseId) => this.resumeCase(caseId),
+      resolveContactTime: async (reference) => resolveRelativeContactTime(reference, this.clock(), this.world.policy).toISOString()
+    };
+  }
+
+  protected async requestCaseInvestigation(caseId: string) {
+    const recoveryCase = this.getCase(caseId);
+    const obligation = this.world.obligations.find((item) => item.id === recoveryCase.obligationId);
+    if (!obligation) throw new RepositoryError("NOT_FOUND", "Obligation not found.");
+    if (["cancelled", "review_required"].includes(obligation.status) || isFullyPaid(obligation.amountDue, obligation.amountPaid)) throw new RepositoryError("POLICY_BLOCKED", "This case is not eligible for another investigation.");
+    const activeJob = this.world.jobs.find((job) => job.caseId === caseId && job.kind === "investigate_case" && ["queued", "running"].includes(job.status));
+    if (activeJob) return { status: "already_queued", caseId, jobId: activeJob.id, nextAction: recoveryCase.nextAction };
+
+    const before = summarizeCaseChange(recoveryCase);
+    if (recoveryCase.state === "detected") {
+      const investigating = transitionCase(recoveryCase, "investigating");
+      Object.assign(recoveryCase, { ...investigating, nextAction: "Investigation queued from the Rebound agent", updatedAt: nowIso() });
+    }
+    const idempotencyKey = `case:${caseId}:chat-investigation:v${recoveryCase.version}`;
+    const job: JobRecord = { id: newId("job"), merchantId: this.world.merchant.id, kind: "investigate_case", idempotencyKey, status: "queued", caseId, attempts: 0 };
+    this.world.jobs.push(job);
+    this.addAudit({ actor: "agent", eventType: "agent.investigation.requested", entityType: "case", entityId: caseId, summary: "The bounded agent queued an evidence investigation; provider inference and any external action remain separate.", before, after: { ...summarizeCaseChange(recoveryCase), jobId: job.id }, sourceIds: [] });
+
+    if (this.fixtureAsync && this.selectedAgentProvider() === "fixture" && this.selectedEvidenceProvider() === "fixture") {
+      setTimeout(() => {
+        void (async () => {
+          const currentJob = this.world.jobs.find((item) => item.id === job.id);
+          if (!currentJob || currentJob.status !== "queued") return;
+          currentJob.status = "running";
+          try {
+            await this.investigateCase(caseId, "explicit_investigation");
+            currentJob.status = "completed";
+          } catch (error) {
+            currentJob.status = "failed";
+            currentJob.lastError = error instanceof Error ? error.message : "Investigation failed";
+          }
+        })();
+      }, 25);
+    }
+    return { status: "queued", caseId, jobId: job.id, nextAction: recoveryCase.nextAction };
   }
 
   async getCustomerPage(publicToken: string): Promise<CustomerPageData | null> {
@@ -1006,6 +1096,10 @@ export class MemoryRepository implements RecoveryRepository {
     recoveryCase.nextAction = pauseUntil ? `Recheck after ${new Date(pauseUntil).toLocaleDateString("en-IN", { day: "numeric", month: "short" })}` : "Resume only when a permitted next step is clear";
     recoveryCase.updatedAt = nowIso();
     this.cancelCaseJobs(caseId, reason);
+    if (pauseUntil) {
+      const idempotencyKey = `case:${caseId}:recheck:${pauseUntil}`;
+      if (!this.world.jobs.some((job) => job.idempotencyKey === idempotencyKey)) this.world.jobs.push({ id: newId("job"), merchantId: this.world.merchant.id, kind: "recheck_promise", idempotencyKey, status: "queued", caseId, runAfter: pauseUntil, attempts: 0 });
+    }
     this.addAudit({ actor: "merchant", eventType: "case.paused", entityType: "case", entityId: caseId, summary: `${this.isDemoPayment() ? `${reason} · Demo simulation` : reason}`, before, after: summarizeCaseChange(recoveryCase), sourceIds: [] , demo: this.isDemoPayment() });
     return recoveryCase;
   }
@@ -1051,13 +1145,68 @@ export class MemoryRepository implements RecoveryRepository {
     this.addAudit({ actor: "system", eventType: "batch.completed", entityType: "batch_run", entityId: batch.id, summary: `Batch review completed with ${batch.completedCaseIds.length} successful and ${batch.failedCaseIds.length} failed case investigations.`, after: { status: batch.status, completedCaseIds: batch.completedCaseIds, failedCaseIds: batch.failedCaseIds }, sourceIds: batch.caseIds });
   }
 
-  async submitInstruction(caseId: string | undefined, instruction: string) {
+  protected invokeRecoveryChat(input: ChatInvocationInput) {
+    return runRecoveryChat(input);
+  }
+
+  protected async executeAgentChat(caseId: string | undefined, prompt: string, inputHash: string): Promise<AgentChatResponse> {
+    const anchorCase = caseId ? this.getCase(caseId) : this.world.cases.find((item) => item.primary && item.state !== "closed") || this.world.cases.find((item) => item.state !== "closed") || this.world.cases[0];
+    if (!anchorCase) throw new RepositoryError("NOT_FOUND", "No recovery case is available to anchor this agent run.");
+    const selectedProvider = this.selectedAgentProvider();
+    const snapshot = JSON.stringify(this.world);
+    const runId = newId("run");
+    const instructionRecord: InstructionRecord = { id: newId("instruction"), merchantId: this.world.merchant.id, caseId, instruction: prompt, intent: "case_review", status: "received", createdAt: nowIso() };
+    this.world.instructions.unshift(instructionRecord);
+    const run: AgentRun = { id: runId, merchantId: this.world.merchant.id, caseId: anchorCase.id, provider: selectedProvider, model: selectedProvider === "fixture" ? "scripted-fixture-recovery-chat-v1" : selectedProvider === "fireworks" ? runtimeConfig().fireworksModel : "codex-app-server", status: "running", stepCount: 0, toolCallSummaries: [], invocationReason: "explicit_chat", inputHash, startedAt: nowIso() };
+    this.world.agentRuns.unshift(run);
+    this.addAudit({ actor: "agent", eventType: "agent.chat.started", entityType: "agent_run", entityId: run.id, summary: `Started one bounded ${selectedProvider} chat run for the merchant workspace.`, after: { runId, provider: selectedProvider, selectedCaseId: caseId, anchorCaseId: anchorCase.id, inputHash }, sourceIds: [], provider: selectedProvider, invocationReason: "explicit_chat", inputHash });
+    try {
+      const result: AgentChatResult = await this.invokeRecoveryChat({ context: this.chatToolContext(run.id), prompt, selectedCaseId: caseId, anchorCaseId: anchorCase.id, inputHash, invocationReason: "explicit_chat" });
+      const text = result.text.trim();
+      if (!text) throw new Error("AGENT_EMPTY_RESPONSE:Configured agent returned no visible response.");
+      run.status = "completed";
+      run.model = result.model;
+      run.stepCount = Math.min(5, Math.max(1, result.steps));
+      run.toolCallSummaries = result.toolCallSummaries.slice(0, 5);
+      run.usage = result.usage;
+      run.finishedAt = nowIso();
+      instructionRecord.status = "completed";
+      instructionRecord.completedAt = run.finishedAt;
+      const completedCase = caseId ? this.world.cases.find((item) => item.id === caseId) : undefined;
+      instructionRecord.pauseUntil = completedCase?.pauseUntil;
+      this.addAudit({ actor: "agent", eventType: "agent.chat.completed", entityType: "agent_run", entityId: run.id, summary: `${selectedProvider} returned a bounded workspace-grounded response; mutations remain deterministic and approval-gated.`, after: { runId, response: text.slice(0, 4000), provider: result.provider, selectedCaseId: caseId, toolCallSummaries: run.toolCallSummaries, stepCount: run.stepCount }, sourceIds: [], provider: result.provider, invocationReason: "explicit_chat", inputHash, usage: result.usage });
+      return { case: caseId ? this.getCase(caseId) : undefined, message: text, agent: { runId, provider: result.provider, model: result.model, toolCallSummaries: run.toolCallSummaries, status: "completed" } };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Unknown configured agent failure";
+      this.world = JSON.parse(snapshot) as DemoWorld;
+      const failedRun: AgentRun = { ...run, status: "failed", error: errorMessage, finishedAt: nowIso() };
+      this.world.agentRuns.unshift(failedRun);
+      this.addAudit({ actor: "agent", eventType: "agent.chat.failed", entityType: "agent_run", entityId: failedRun.id, summary: `The configured ${selectedProvider} chat provider failed. No canned operational response or state mutation was applied.`, after: { runId, provider: selectedProvider, error: errorMessage }, sourceIds: [], provider: selectedProvider, invocationReason: "explicit_chat", inputHash });
+      if (error instanceof RepositoryError && error.code === "AGENT_PROVIDER_FAILED") throw error;
+      throw new RepositoryError("AGENT_PROVIDER_FAILED", `The configured ${selectedProvider} agent failed. No canned response or state mutation was applied.`, { runId, provider: selectedProvider, error: errorMessage });
+    }
+  }
+
+  protected async submitAgentChat(caseId: string | undefined, instruction: string): Promise<AgentChatResponse> {
+    const inputHash = canonicalChatInputHash(this.world, instruction, caseId);
+    const previousRun = this.world.agentRuns.find((run) => run.provider === this.selectedAgentProvider() && run.invocationReason === "explicit_chat" && run.inputHash === inputHash && run.status === "completed");
+    if (previousRun) {
+      const previousAudit = this.world.audit.find((event) => event.eventType === "agent.chat.completed" && event.entityId === previousRun.id);
+      const response = typeof previousAudit?.after?.response === "string" ? previousAudit.after.response : undefined;
+      if (response) return { case: caseId ? this.getCase(caseId) : undefined, message: response, agent: { runId: previousRun.id, provider: previousRun.provider, model: previousRun.model, toolCallSummaries: previousRun.toolCallSummaries, status: "deduplicated" } };
+    }
+    const inFlight = this.chatInFlight.get(inputHash);
+    if (inFlight) return inFlight;
+    const task = this.executeAgentChat(caseId, instruction, inputHash);
+    this.chatInFlight.set(inputHash, task);
+    try { return await task; } finally { if (this.chatInFlight.get(inputHash) === task) this.chatInFlight.delete(inputHash); }
+  }
+
+  async submitInstruction(caseId: string | undefined, instruction: string): Promise<{ case?: RecoveryCase; message: string; batchRun?: BatchRun; agent?: { runId: string; provider: AgentProvider; model: string; toolCallSummaries: string[]; status: "completed" | "deduplicated" } }> {
     const trimmed = instruction.trim();
+    if (isGreeting(trimmed)) return { message: "Hi — I’m Rebound. Ask me about the current workspace or case, and I’ll use the configured agent within the visible guardrails." };
     const lower = trimmed.toLowerCase();
-    if (isWorkspaceQuestion(trimmed) && !lower.includes("review these cases")) return { message: answerWorkspaceQuestion(this.world, trimmed) };
-    const targetedCase = findInstructionCase(this.world, caseId, trimmed);
-    if (targetedCase && (/what .*block|blocking|current evidence|case status|explain .*status|explain .*evidence|why .*stuck|what happened/.test(lower))) return { case: targetedCase, message: answerCaseQuestion(this.world, targetedCase) };
-    const isBatch = lower.includes("review these cases") || lower.includes("resolve what you can") || lower.includes("bring me anything");
+    const isBatch = isBatchReviewRequest(trimmed);
     if (isBatch) {
       const eligible = this.world.cases.filter((item) => {
         const obligation = this.world.obligations.find((candidate) => candidate.id === item.obligationId);
@@ -1076,33 +1225,8 @@ export class MemoryRepository implements RecoveryRepository {
       if (this.fixtureAsync && this.selectedAgentProvider() === "fixture" && this.selectedEvidenceProvider() === "fixture") setTimeout(() => { void this.processFixtureBatch(batch, instructionRecord); }, 25);
       return { case: caseId ? this.getCase(caseId) : undefined, batchRun: batch, message: this.selectedAgentProvider() === "fixture" && this.selectedEvidenceProvider() === "fixture" ? `Batch review queued for ${batch.caseIds.length} eligible cases. The demo worker is retrieving evidence and preparing reviewable actions.` : `Batch review queued for ${batch.caseIds.length} eligible cases. The persistent worker will investigate them independently.` };
     }
-    if (!targetedCase) return { message: answerWorkspaceQuestion(this.world, trimmed) };
-    const recoveryCase = targetedCase;
-    if (/(^|\b)(unpause|resume|reopen)(\b|$)|resume outreach|continue outreach/.test(lower)) {
-      const resumed = await this.resumeCase(recoveryCase.id);
-      return { case: resumed, message: `I resumed ${customerFor(this.world, resumed)?.displayName || "this case"} for a fresh evidence recheck. No external message was sent.` };
-    }
-    if (lower.includes("friday") || lower.includes("do not contact") || lower.includes("don't contact")) {
-      const pauseUntil = resolveRelativeContactTime(trimmed.includes("friday") || trimmed.includes("Friday") ? trimmed : "Friday", this.clock(), this.world.policy).toISOString();
-      const instructionRecord: InstructionRecord = { id: newId("instruction"), merchantId: this.world.merchant.id, caseId: recoveryCase.id, instruction: trimmed, intent: "pause_contact", status: "queued", pauseUntil, createdAt: nowIso() };
-      this.world.instructions.unshift(instructionRecord);
-      const paused = await this.pauseCase(recoveryCase.id, `Merchant instruction persisted: do not contact before ${pauseUntil}`, pauseUntil);
-      const idempotencyKey = `case:${recoveryCase.id}:instruction:${pauseUntil}`;
-      if (!this.world.jobs.some((job) => job.idempotencyKey === idempotencyKey)) this.world.jobs.push({ id: newId("job"), merchantId: this.world.merchant.id, kind: "recheck_promise", idempotencyKey, status: "queued", caseId, runAfter: pauseUntil, attempts: 0 });
-      instructionRecord.status = "completed";
-      instructionRecord.completedAt = nowIso();
-      this.addAudit({ actor: "merchant", eventType: "instruction.persisted", entityType: "case", entityId: recoveryCase.id, summary: "Merchant instruction persisted as a policy-constrained recheck job.", after: { instructionId: instructionRecord.id, instruction: trimmed, pauseUntil }, sourceIds: [] });
-      return { case: paused, message: `I paused outreach for ${customerFor(this.world, paused)?.displayName || "this case"} and scheduled a recheck for ${pauseUntil}. A promise is not treated as payment authorization.` };
-    }
-    if (/\b(pause|stop outreach|do not contact|don't contact)\b/.test(lower)) {
-      const paused = await this.pauseCase(recoveryCase.id, "Merchant paused outreach from the bounded agent controls");
-      return { case: paused, message: `I paused outreach for ${customerFor(this.world, paused)?.displayName || "this case"}. No customer-facing action was sent.` };
-    }
-    if (/\b(investigate|review|retrieve|look into|find the blocker|run an evidence)\b/.test(lower)) {
-      const result = await this.investigateCase(recoveryCase.id);
-      return { case: this.getCase(recoveryCase.id), message: ("skipped" in result && result.skipped) ? "This case already has the same evidence hash, so I skipped a duplicate provider call." : `I started a bounded evidence review for ${customerFor(this.world, recoveryCase)?.displayName || "this case"}. I will stop at a proposal or an evidence gap.` };
-    }
-    return { case: recoveryCase, message: answerCaseQuestion(this.world, recoveryCase) };
+    void lower;
+    return this.submitAgentChat(caseId, trimmed);
   }
 
   async resolveIncident(incidentId: string) {

@@ -4,12 +4,14 @@ import { ToolLoopAgent, stepCountIs } from "ai";
 import type { ToolSet } from "ai";
 import { z } from "zod";
 import type { AgentInvocationReason, AgentProvider, Proposal } from "@/shared/types";
-import type { RecoveryToolContext } from "@/server/agent/tools";
-import { recoveryTools } from "@/server/agent/tools";
+import type { RecoveryChatToolContext, RecoveryToolContext } from "@/server/agent/tools";
+import { recoveryChatTools, recoveryTools } from "@/server/agent/tools";
 import { assertAgentCredentials, FIREWORKS_MODEL, runtimeConfig } from "@/server/config";
 import { proposalSchema } from "@/server/agent/schemas";
 
 export const RECOVERY_AGENT_INSTRUCTIONS = `You are a cautious financial-operations coworker for ${process.env.PRODUCT_NAME || "Rebound"}. Distinguish evidence from inference, prefer the least aggressive effective intervention, obey the merchant policy and strict tool schemas, and stop when evidence is insufficient. You may read scoped evidence and create reviewable proposals only. Never send a message, create/cancel a payment link, mutate payment state, post a ledger entry, or claim a payment succeeded. Only an authoritative verified Razorpay event can record recovery. Keep explanations concise and cite visible evidence IDs. Never reveal hidden reasoning or connector secrets.`;
+
+export const RECOVERY_CHAT_AGENT_INSTRUCTIONS = `You are Rebound, a cautious financial-operations coworker. This is a live conversational turn for a merchant workspace. Answer the merchant's actual request using the tenant-scoped workspace snapshot and bounded tools; do not guess, invent current state, or return a canned workspace summary. For workspace or case questions, use the read-only tools that are relevant to the request and cite visible customer names, states, evidence, policy or audit facts. For "investigate", use the bounded investigate_case operation. For pause/resume, use the corresponding deterministic operation for the exact case and report its result. For any customer-facing or monetary action, create a reviewable proposal instead of executing it; approval remains mandatory. Never send email, create or activate a payment link, mark money recovered, post a ledger entry, bypass policy, or claim payment success. Distinguish Demo/Fixture evidence from live provider evidence. Keep the response concise, state uncertainty plainly, and stop within the tool limit.`;
 
 export interface AgentInvocationInput {
   context: RecoveryToolContext;
@@ -28,6 +30,24 @@ export interface AgentInvocationResult {
   toolCallSummaries?: string[];
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
   proposal?: Omit<Proposal, "id" | "merchantId" | "caseId" | "obligationId" | "modelRunId" | "actionVersion" | "createdAt" | "status" | "policy" | "requiresApproval"> & { type: Proposal["type"] };
+}
+
+export interface ChatInvocationInput {
+  context: RecoveryChatToolContext;
+  prompt: string;
+  selectedCaseId?: string;
+  anchorCaseId: string;
+  inputHash: string;
+  invocationReason: "explicit_chat";
+}
+
+export interface AgentChatResult {
+  provider: AgentProvider;
+  model: string;
+  text: string;
+  steps: number;
+  toolCallSummaries: string[];
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
 }
 
 const remoteProposalSchema = proposalSchema.extend({ type: z.enum(["recovery_message", "document_response", "signal_merge", "pause_or_resume", "promise_schedule", "escalation"]) });
@@ -98,21 +118,148 @@ export function buildRecoveryAgent(context: RecoveryToolContext, workflow: Agent
   });
 }
 
+export function buildRecoveryChatAgent(context: RecoveryChatToolContext) {
+  return new ToolLoopAgent({
+    model: fireworks(FIREWORKS_MODEL),
+    instructions: RECOVERY_CHAT_AGENT_INSTRUCTIONS,
+    tools: recoveryChatTools(context),
+    stopWhen: stepCountIs(5),
+    temperature: 0.1
+  });
+}
+
+type AgentSdkUsage = { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+type AgentSdkResult = { text?: string; steps?: unknown[]; usage?: AgentSdkUsage };
+type ChatAgentExecutor = { generate(input: { prompt: string }): Promise<AgentSdkResult> };
+type ChatAgentFactory = (context: RecoveryChatToolContext) => ChatAgentExecutor;
+
+const defaultChatAgentFactory: ChatAgentFactory = (context) => buildRecoveryChatAgent(context) as unknown as ChatAgentExecutor;
+
+function toolCallSummaries(steps: unknown[] | undefined) {
+  const summaries: string[] = [];
+  for (const step of steps || []) {
+    const stepRecord = recordValue(step);
+    const calls = Array.isArray(stepRecord?.toolCalls) ? stepRecord.toolCalls : [];
+    for (const call of calls) {
+      const callRecord = recordValue(call);
+      const name = stringValue(callRecord?.toolName) || stringValue(callRecord?.name);
+      if (name) summaries.push(name);
+    }
+  }
+  return [...new Set(summaries)].slice(0, 5);
+}
+
+function compactChatCase(value: unknown) {
+  const record = recordValue(value);
+  if (!record) return undefined;
+  const customer = recordValue(record.customer);
+  const obligation = recordValue(record.obligation);
+  return {
+    id: record.id,
+    workflow: record.workflow,
+    state: record.state,
+    priority: record.priority,
+    blocker: record.blocker,
+    confidence: record.confidence,
+    reason: record.reason,
+    nextAction: record.nextAction,
+    customer: customer && { id: customer.id, displayName: customer.displayName, type: customer.type },
+    obligation: obligation && { id: obligation.id, kind: obligation.kind, amountDue: obligation.amountDue, amountPaid: obligation.amountPaid, currency: obligation.currency, orderRef: obligation.orderRef, invoiceRef: obligation.invoiceRef }
+  };
+}
+
+async function buildChatPrompt(input: ChatInvocationInput) {
+  const workspace = await input.context.readWorkspaceSummary();
+  const selectedCase = input.selectedCaseId ? compactChatCase(await input.context.readCaseSummary(input.selectedCaseId)) : undefined;
+  return `${RECOVERY_CHAT_AGENT_INSTRUCTIONS}
+
+Use the supplied snapshot as the starting point, then call the narrowest read-only or bounded operation needed for the merchant's request. The snapshot is tenant-scoped and may contain clearly labelled Demo/Fixture records. Never treat fixture evidence or simulated payment status as live.
+
+Merchant request: ${input.prompt}
+Selected case ID: ${input.selectedCaseId || "none"}
+Workspace snapshot: ${JSON.stringify({ workspace, selectedCase })}`;
+}
+
 class FixtureAgentProvider {
   readonly provider = "fixture" as const;
   async invoke(input: AgentInvocationInput): Promise<AgentInvocationResult> {
     return { provider: this.provider, model: "scripted-fixture-recovery-v1", text: `Deterministic fixture review for ${input.caseId}.`, steps: 0, toolCallSummaries: ["fixture_provider_selected", "deterministic_policy_path"] };
   }
+
+  async invokeChat(input: ChatInvocationInput): Promise<AgentChatResult> {
+    const workspace = await input.context.readWorkspaceSummary();
+    const workspaceRecord = recordValue(workspace);
+    const lower = input.prompt.toLowerCase();
+    const workspaceCases = await input.context.readWorkspaceCases();
+    const promptCase = workspaceCases.find((item) => {
+      const customer = recordValue(item.customer);
+      const name = typeof customer?.displayName === "string" ? customer.displayName.toLowerCase() : "";
+      return name.length > 0 && lower.includes(name);
+    });
+    const targetCaseId = typeof promptCase?.id === "string" ? promptCase.id : input.selectedCaseId;
+    const selected = targetCaseId ? await input.context.readCaseSummary(targetCaseId) : undefined;
+    const selectedName = selected?.customer.displayName || "the workspace";
+    if (targetCaseId && /\b(pause|stop outreach|do not contact|don't contact)\b/.test(lower)) {
+      const pauseUntil = lower.includes("friday") ? await input.context.resolveContactTime("Friday") : undefined;
+      const paused = await input.context.pauseOutreach(targetCaseId, `Fixture agent applied the merchant's bounded instruction${pauseUntil ? ` until ${pauseUntil}` : ""}`, pauseUntil);
+      return { provider: this.provider, model: "scripted-fixture-recovery-chat-v1", text: `Fixture agent (no model call): I paused outreach for ${paused.id === selected?.id ? selectedName : "the requested case"}${pauseUntil ? ` until ${pauseUntil}` : ""}. No customer-facing action was sent.`, steps: 2, toolCallSummaries: ["fixture_chat_provider", "pause_outreach"] };
+    }
+    if (targetCaseId && /\b(unpause|resume|reopen)\b/.test(lower)) {
+      const resumed = await input.context.resumeOutreach(targetCaseId);
+      return { provider: this.provider, model: "scripted-fixture-recovery-chat-v1", text: `Fixture agent (no model call): I resumed the requested case (${resumed.id}) for an evidence recheck. No customer-facing action was sent.`, steps: 2, toolCallSummaries: ["fixture_chat_provider", "resume_outreach"] };
+    }
+    if (targetCaseId && /\b(investigate|review evidence|look into|find the blocker)\b/.test(lower)) {
+      const queued = await input.context.requestInvestigation(targetCaseId);
+      return { provider: this.provider, model: "scripted-fixture-recovery-chat-v1", text: `Fixture agent (no model call): I ${queued.status === "already_queued" ? "confirmed that" : "queued"} a bounded evidence investigation for ${targetCaseId}. The worker will retrieve only scoped evidence; no external action was sent.`, steps: 2, toolCallSummaries: ["fixture_chat_provider", "investigate_case"] };
+    }
+    const caseCount = Number(workspaceRecord?.openCaseCount || 0);
+    const affectedCustomers = Array.isArray(workspaceRecord?.affectedCustomers) ? workspaceRecord.affectedCustomers.filter((item): item is string => typeof item === "string") : [];
+    const workspaceAnswer = /which customers?|who .*affected/.test(lower)
+      ? `Affected customers: ${affectedCustomers.join(", ") || "none"}.`
+      : /how many (issues|cases|problems)/.test(lower)
+        ? `There are ${caseCount} open recovery cases across ${affectedCustomers.length} customers.`
+        : undefined;
+    const selectedAnswer = selected && selected.confidence === 0 && selected.workflow === "invoice_resolution"
+      ? `${selectedName} is awaiting evidence retrieval. External evidence not retrieved yet; no blocker has been classified.`
+      : selected
+        ? `${selectedName} is ${selected.state} with ${selected.blocker.replaceAll("_", " ")} as the current blocker.`
+        : undefined;
+    return {
+      provider: this.provider,
+      model: "scripted-fixture-recovery-chat-v1",
+      text: `Fixture agent (no model call): I received “${input.prompt}”. ${workspaceAnswer || selectedAnswer || (selected ? `${selectedName} is ${selected.state}.` : `There are ${caseCount} open recovery cases in this demo workspace.`)} This is Demo/Fixture data; ask for a bounded investigation or action when you want the deterministic workflow to proceed.`,
+      steps: 1,
+      toolCallSummaries: ["fixture_chat_provider", selected ? "read_case_summary" : "read_workspace_summary"]
+    };
+  }
 }
 
-class FireworksAgentProvider {
+export class FireworksAgentProvider {
   readonly provider = "fireworks" as const;
+  constructor(private readonly chatAgentFactory: ChatAgentFactory = defaultChatAgentFactory) {}
+
   async invoke(input: AgentInvocationInput): Promise<AgentInvocationResult> {
     const config = assertAgentCredentials();
     const agent = buildRecoveryAgent(input.context, input.workflow);
     const result = await agent.generate({ prompt: input.prompt });
     const usage = result.usage ? { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, totalTokens: result.usage.totalTokens } : undefined;
     return { provider: this.provider, model: config.fireworksModel, text: result.text, steps: result.steps?.length || 0, usage, toolCallSummaries: ["fireworks_tool_loop"] };
+  }
+
+  async invokeChat(input: ChatInvocationInput): Promise<AgentChatResult> {
+    const config = assertAgentCredentials();
+    const agent = this.chatAgentFactory(input.context);
+    const result = await agent.generate({ prompt: await buildChatPrompt(input) });
+    const text = result.text?.trim();
+    if (!text) throw new Error("FIREWORKS_EMPTY_RESPONSE:Configured Fireworks agent returned no visible response.");
+    return {
+      provider: this.provider,
+      model: config.fireworksModel,
+      text,
+      steps: Math.min(5, Math.max(1, result.steps?.length || 1)),
+      usage: result.usage,
+      toolCallSummaries: ["fireworks_chat", ...toolCallSummaries(result.steps)].slice(0, 5)
+    };
   }
 }
 
@@ -445,8 +592,22 @@ export function getAgentProvider(provider: AgentProvider = runtimeConfig().agent
   return new CodexAppServerAgentProvider();
 }
 
+export interface RecoveryChatProvider {
+  invokeChat(input: ChatInvocationInput): Promise<AgentChatResult>;
+}
+
+export function getAgentChatProvider(provider: AgentProvider = runtimeConfig().agentProvider): RecoveryChatProvider {
+  if (provider === "fixture") return new FixtureAgentProvider();
+  if (provider === "fireworks") return new FireworksAgentProvider();
+  throw new Error("AGENT_CHAT_PROVIDER_UNSUPPORTED:Native Codex app-server chat is not enabled for this bounded workspace drawer.");
+}
+
 export async function runRecoveryAgent(input: AgentInvocationInput) {
   return getAgentProvider().invoke(input);
+}
+
+export async function runRecoveryChat(input: ChatInvocationInput) {
+  return getAgentChatProvider().invokeChat(input);
 }
 
 export async function runLiveRecoveryAgent(context: RecoveryToolContext, workflow: AgentInvocationInput["workflow"], prompt: string) {

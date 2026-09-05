@@ -9,7 +9,7 @@ export type EvidenceProvider = "fixture" | "google" | "composio";
 export type PaymentProvider = "fixture" | "razorpay_test";
 export type StorageProvider = "memory" | "postgres";
 export type ProviderMode = "fixture" | "test" | "live" | "google" | "composio" | "codex_app_server";
-export type AgentInvocationReason = "explicit_investigation" | "new_evidence" | "changed_circumstance" | "approved_workflow";
+export type AgentInvocationReason = "explicit_investigation" | "explicit_chat" | "new_evidence" | "changed_circumstance" | "approved_workflow";
 
 export type ActorType = "system" | "agent" | "merchant" | "customer" | "connector";
 

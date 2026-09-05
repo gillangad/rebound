@@ -4,7 +4,7 @@ import { attachDemoSession, getDemoSession, type DemoSession } from "@/server/wo
 
 export function jsonError(error: unknown) {
   if (error instanceof RepositoryError) {
-    const status = error.code === "NOT_FOUND" ? 404 : error.code === "STALE_VERSION" || error.code === "PROVIDER_MISMATCH" ? 409 : error.code === "DATABASE_REQUIRED" || error.code === "WORKSPACE_REQUIRED" ? 503 : 422;
+    const status = error.code === "NOT_FOUND" ? 404 : error.code === "STALE_VERSION" || error.code === "PROVIDER_MISMATCH" ? 409 : error.code === "DATABASE_REQUIRED" || error.code === "WORKSPACE_REQUIRED" || error.code === "AGENT_PROVIDER_FAILED" ? 503 : 422;
     return Response.json({ error: { code: error.code, message: error.message, details: error.details } }, { status });
   }
   const message = error instanceof Error ? error.message : "Unexpected server error";

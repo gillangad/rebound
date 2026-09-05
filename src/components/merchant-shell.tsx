@@ -109,18 +109,20 @@ export function MerchantShell({ section }: { section: Section }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [closeDrawer, drawerOpen]);
 
-  const mutate = async (key: string, url: string, body?: Record<string, unknown>) => {
+  const mutate = async (key: string, url: string, body?: Record<string, unknown>, onError?: (message: string) => void) => {
     setBusyKey(key);
     setNotice(null);
     try {
       const response = await fetch(url, { method: body ? "POST" : "PATCH", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-      const result = await response.json() as { error?: { message?: string }; message?: string };
+      const result = await response.json() as { error?: { message?: string }; message?: string; agent?: { provider?: string; toolCallSummaries?: string[] } };
       if (!response.ok) throw new Error(result.error?.message || "Action could not be completed.");
       setNotice(typeof result.message === "string" ? result.message : "Saved.");
       await refresh(true);
       return result;
     } catch (actionError) {
-      setNotice(actionError instanceof Error ? actionError.message : "Action could not be completed.");
+      const message = actionError instanceof Error ? actionError.message : "Action could not be completed.";
+      setNotice(message);
+      onError?.(message);
       return null;
     } finally {
       setBusyKey(null);
@@ -134,6 +136,7 @@ export function MerchantShell({ section }: { section: Section }) {
   const activeIncidentCount = data?.incidents.filter((item) => item.status === "active").length || 0;
   const orbState = useMemo<OrbState>(() => {
     if (!data) return "idle";
+    if (busyKey === "instruction") return "working";
     const reportedState = data.orb.state;
     if ((reportedState === "uncertain" || reportedState === "error") && (!selectedCase || !data.orb.caseId || data.orb.caseId === selectedCase.id)) return reportedState;
     if (selectedIncident?.status === "active") return "paused";
@@ -145,7 +148,7 @@ export function MerchantShell({ section }: { section: Section }) {
     if (selectedCase.state === "investigating") return reportedState === "inspecting" ? "inspecting" : "working";
     if (selectedCase.state === "proposed") return selectedCase.proposals.some((proposal) => proposal.status === "pending" && proposal.requiresApproval) ? "approval" : "working";
     return reportedState === "inspecting" || reportedState === "working" ? reportedState : "idle";
-  }, [data, selectedCase, selectedIncident]);
+  }, [busyKey, data, selectedCase, selectedIncident]);
   const orbLabel = orbState === "approval" ? "Approval required" : orbState === "paused" ? "Paused" : orbState === "success" ? "Payment verified" : orbState === "working" || orbState === "inspecting" ? "Investigating" : orbState === "uncertain" ? "Needs review" : orbState === "error" ? "Provider needs attention" : "Agent idle";
 
   const toggleTheme = () => {
@@ -161,9 +164,15 @@ export function MerchantShell({ section }: { section: Section }) {
     if (!request) return;
     setAgentMessages((current) => [...current, { id: `${Date.now()}-user`, role: "user", text: request }]);
     setInstruction("");
-    const result = await mutate("instruction", "/api/instructions", { caseId: selectedCaseId, instruction: request });
+    let failureMessage = "The configured agent could not complete this request.";
+    const result = await mutate("instruction", "/api/instructions", { caseId: selectedCaseId, instruction: request }, (message) => { failureMessage = message; });
     if (result) {
-      setAgentMessages((current) => [...current, { id: `${Date.now()}-assistant`, role: "assistant", text: typeof result.message === "string" ? result.message : "I could not produce a bounded response." }]);
+      const activity = result.agent?.toolCallSummaries?.length ? `\n\nActivity: ${result.agent.toolCallSummaries.join(" → ")}.` : "";
+      setAgentMessages((current) => [...current, { id: `${Date.now()}-assistant`, role: "assistant", text: `${typeof result.message === "string" ? result.message : "I could not produce a bounded response."}${activity}` }]);
+      setDrawerOpen(true);
+    } else {
+      await refresh(true);
+      setAgentMessages((current) => [...current, { id: `${Date.now()}-assistant-error`, role: "assistant", text: `I couldn't complete that agent request. ${failureMessage} No canned operational response was used, and authoritative state was left unchanged.` }]);
       setDrawerOpen(true);
     }
   };

@@ -2,8 +2,9 @@ import { EventEmitter } from "node:events";
 import { spawn as nativeSpawn } from "node:child_process";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CodexAppServerAgentProvider, type AgentInvocationInput } from "@/server/agent/agent";
-import type { RecoveryToolContext } from "@/server/agent/tools";
+import { CodexAppServerAgentProvider, FireworksAgentProvider, type AgentInvocationInput } from "@/server/agent/agent";
+import type { RecoveryChatToolContext, RecoveryToolContext } from "@/server/agent/tools";
+import { recoveryChatTools } from "@/server/agent/tools";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -84,5 +85,78 @@ describe("native Codex app-server provider", () => {
     expect(requests.map((request) => request.method)).toEqual(["initialize", "initialized", "thread/start", "turn/start"]);
     expect(spawnedOptions?.env.FIREWORKS_API_KEY).toBeUndefined();
     expect(processLike.kill).toHaveBeenCalled();
+  });
+});
+
+describe("bounded Fireworks chat provider", () => {
+  function chatContext(): RecoveryChatToolContext {
+    const view = {
+      id: "case-city",
+      workflow: "invoice_resolution",
+      state: "detected",
+      blocker: "missing_document",
+      confidence: 0,
+      reason: "Evidence review is pending",
+      nextAction: "Review evidence",
+      customer: { id: "customer-city", type: "business", displayName: "City Interiors", email: "city@example.com" },
+      obligation: { id: "obligation-city", customerId: "customer-city", kind: "invoice", amountDue: 48000000, amountPaid: 0, currency: "INR", invoiceRef: "NSO-INV-2048" },
+      signals: [],
+      messages: [],
+      documents: [],
+      proposals: [],
+      latestAudit: []
+    };
+    const scoped = async (caseId: string) => {
+      if (caseId !== "case-city") throw new Error("TENANT_SCOPE_BLOCKED");
+      return view as never;
+    };
+    return {
+      readWorkspaceSummary: async () => ({ openCaseCount: 1, affectedCustomers: ["City Interiors"], demo: true }),
+      readWorkspaceCases: async () => [{ id: "case-city", customer: { displayName: "City Interiors" }, state: "detected", blocker: "missing_document" }],
+      readHistory: async () => [],
+      readCaseSummary: scoped,
+      readPaymentFailure: async (caseId) => { await scoped(caseId); return { status: "no_attempt_recorded" }; },
+      findRelatedSignals: async (caseId) => { await scoped(caseId); return []; },
+      searchCustomerMessages: async (caseId) => { await scoped(caseId); return []; },
+      searchCaseDocuments: async (caseId) => { await scoped(caseId); return []; },
+      readActivePolicies: async (caseId) => { await scoped(caseId); return {} as never; },
+      readIncidentContext: async (caseId) => { await scoped(caseId); return { status: "no_incident" }; },
+      createProposal: async () => { throw new Error("not used"); },
+      requestInvestigation: async (caseId) => { await scoped(caseId); return { status: "queued" }; },
+      pauseOutreach: async (caseId) => { await scoped(caseId); return view as never; },
+      resumeOutreach: async (caseId) => { await scoped(caseId); return view as never; },
+      resolveContactTime: async () => "2026-09-11T03:30:00.000Z"
+    };
+  }
+
+  it("routes substantive chat to Fireworks and exposes bounded tool activity", async () => {
+    vi.stubEnv("AGENT_PROVIDER", "fireworks");
+    vi.stubEnv("FIREWORKS_API_KEY", "configured-for-test");
+    vi.stubEnv("FIREWORKS_MODEL", "accounts/fireworks/models/test-model");
+    const generate = vi.fn(async ({ prompt }: { prompt: string }) => ({
+      text: prompt.includes("City Interiors") ? "City Interiors is blocked pending evidence retrieval." : "The scoped case is awaiting evidence.",
+      steps: [{ toolCalls: [{ toolName: "read_workspace_summary" }, { toolName: "read_case_summary" }] }],
+      usage: { inputTokens: 42, outputTokens: 12, totalTokens: 54 }
+    }));
+    const provider = new FireworksAgentProvider(() => ({ generate }));
+
+    const result = await provider.invokeChat({ context: chatContext(), prompt: "What are the blockers right now?", selectedCaseId: "case-city", anchorCaseId: "case-city", inputHash: "chat-hash", invocationReason: "explicit_chat" });
+
+    expect(generate).toHaveBeenCalledOnce();
+    expect(generate.mock.calls[0]?.[0].prompt).toContain("City Interiors");
+    expect(result).toMatchObject({ provider: "fireworks", model: "accounts/fireworks/models/test-model", text: "City Interiors is blocked pending evidence retrieval.", usage: { totalTokens: 54 } });
+    expect(result.toolCallSummaries).toEqual(["fireworks_chat", "read_workspace_summary", "read_case_summary"]);
+  });
+
+  it("keeps chat tools tenant-scoped and routes action tools through their deterministic context", async () => {
+    const pause = vi.fn(async (caseId: string, reason: string) => { if (caseId !== "case-city") throw new Error("TENANT_SCOPE_BLOCKED"); return { id: caseId, reason } as never; });
+    const context = { ...chatContext(), pauseOutreach: pause };
+    const tools = recoveryChatTools(context);
+    const readCase = tools.read_case_summary as unknown as { execute(input: { caseId: string }): Promise<unknown> };
+    const pauseTool = tools.pause_outreach as unknown as { execute(input: { caseId: string; reason: string }): Promise<unknown> };
+
+    await expect(readCase.execute({ caseId: "foreign-case" })).rejects.toThrow("TENANT_SCOPE_BLOCKED");
+    await pauseTool.execute({ caseId: "case-city", reason: "Merchant requested a pause" });
+    expect(pause).toHaveBeenCalledWith("case-city", "Merchant requested a pause", undefined);
   });
 });

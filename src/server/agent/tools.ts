@@ -1,6 +1,6 @@
 import { tool } from "ai";
 import { z } from "zod";
-import type { CaseView, Policy, Proposal, RecoveryCase } from "@/shared/types";
+import type { AuditEvent, CaseView, Policy, Proposal, RecoveryCase } from "@/shared/types";
 import { evaluateProposal } from "@/server/domain/policy";
 import { proposalSchema } from "@/server/agent/schemas";
 
@@ -13,6 +13,16 @@ export interface RecoveryToolContext {
   readActivePolicies(caseId: string): Promise<Policy>;
   readIncidentContext(caseId: string): Promise<Record<string, unknown>>;
   createProposal(input: z.infer<typeof proposalSchema> & { type: Proposal["type"] }): Promise<Proposal>;
+}
+
+export interface RecoveryChatToolContext extends RecoveryToolContext {
+  readWorkspaceSummary(): Promise<Record<string, unknown>>;
+  readWorkspaceCases(): Promise<Array<Record<string, unknown>>>;
+  readHistory(filter?: string): Promise<AuditEvent[]>;
+  requestInvestigation(caseId: string): Promise<Record<string, unknown>>;
+  pauseOutreach(caseId: string, reason: string, pauseUntil?: string): Promise<RecoveryCase>;
+  resumeOutreach(caseId: string): Promise<RecoveryCase>;
+  resolveContactTime(reference: string): Promise<string>;
 }
 
 export function recoveryTools(context: RecoveryToolContext) {
@@ -87,6 +97,64 @@ export function recoveryTools(context: RecoveryToolContext) {
       inputSchema: z.object({ caseId: z.string().min(1), summary: z.string().min(1).max(700), uncertainty: z.string().min(1).max(500) }),
       execute: async ({ caseId, summary, uncertainty }) => ({ caseId, summary, uncertainty, status: "complete" as const })
     })
+  };
+}
+
+/**
+ * The chat tool set is deliberately separate from the investigation tool set.
+ * It exposes a compact workspace view and a few existing, policy-aware
+ * operations, while never exposing the repository or provider clients.
+ */
+export function recoveryChatTools(context: RecoveryChatToolContext) {
+  const scoped = recoveryTools(context);
+  return {
+    read_workspace_summary: tool({
+      description: "Read-only. Summarize the current tenant workspace: outstanding value, open cases, approvals, incidents and paused work.",
+      inputSchema: z.object({}),
+      execute: async () => context.readWorkspaceSummary()
+    }),
+    read_workspace_cases: tool({
+      description: "Read-only. List concise, tenant-scoped recovery cases with customer, state, blocker, priority, outstanding amount and next action.",
+      inputSchema: z.object({}),
+      execute: async () => context.readWorkspaceCases()
+    }),
+    read_case_summary: scoped.read_case_summary,
+    read_payment_failure: scoped.read_payment_failure,
+    find_related_signals: scoped.find_related_signals,
+    search_customer_messages: scoped.search_customer_messages,
+    search_case_documents: scoped.search_case_documents,
+    read_active_policies: scoped.read_active_policies,
+    read_incident_context: scoped.read_incident_context,
+    read_history: tool({
+      description: "Read-only. Inspect a concise, tenant-scoped audit history for recent changes and decisions.",
+      inputSchema: z.object({ filter: z.string().max(200).optional() }),
+      execute: async ({ filter }) => context.readHistory(filter)
+    }),
+    resolve_contact_time: tool({
+      description: "Read-only. Resolve a merchant-local date phrase such as Friday into an ISO recheck time; it does not pause or contact anyone.",
+      inputSchema: z.object({ reference: z.string().min(1).max(80) }),
+      execute: async ({ reference }) => context.resolveContactTime(reference)
+    }),
+    investigate_case: tool({
+      description: "Bounded operation. Queue evidence retrieval and investigation for exactly one scoped case. The deterministic worker owns state transitions, policy checks and any proposal; this tool cannot send or mark payment successful.",
+      inputSchema: z.object({ caseId: z.string().min(1) }),
+      execute: async ({ caseId }) => context.requestInvestigation(caseId)
+    }),
+    pause_outreach: tool({
+      description: "Bounded operation. Pause outreach for exactly one scoped case through the deterministic policy/state layer. No customer message is sent and no payment state changes.",
+      inputSchema: z.object({ caseId: z.string().min(1), reason: z.string().min(1).max(300), pauseUntil: z.string().datetime().optional() }),
+      execute: async ({ caseId, reason, pauseUntil }) => context.pauseOutreach(caseId, reason, pauseUntil)
+    }),
+    resume_outreach: tool({
+      description: "Bounded operation. Resume exactly one scoped case through the deterministic state layer for an evidence recheck. No customer message is sent.",
+      inputSchema: z.object({ caseId: z.string().min(1) }),
+      execute: async ({ caseId }) => context.resumeOutreach(caseId)
+    }),
+    propose_recovery_message: scoped.propose_recovery_message,
+    propose_document_response: scoped.propose_document_response,
+    propose_pause_or_resume: scoped.propose_pause_or_resume,
+    propose_promise_schedule: scoped.propose_promise_schedule,
+    propose_escalation: scoped.propose_escalation
   };
 }
 

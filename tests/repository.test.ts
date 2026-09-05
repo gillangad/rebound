@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryRepository } from "@/server/db/repository";
+import type { AgentChatResult, ChatInvocationInput } from "@/server/agent/agent";
 
 const batchInstruction = "Review these cases independently, resolve what you can, and bring me anything that needs approval.";
 
@@ -20,8 +21,19 @@ function caseByName(repo: MemoryRepository, name: string) {
   return recoveryCase!;
 }
 
+class ChatTestRepository extends MemoryRepository {
+  constructor(private readonly chat: (input: ChatInvocationInput) => Promise<AgentChatResult>) {
+    super(undefined, undefined, { fixtureAsync: false });
+    this.world.merchant.agentProvider = "fireworks";
+  }
+
+  protected override invokeRecoveryChat(input: ChatInvocationInput) {
+    return this.chat(input);
+  }
+}
+
 describe("fixture recovery service", () => {
-  it("answers bounded agent questions without creating a job or agent run", async () => {
+  it("routes substantive questions through the bounded agent and records each run", async () => {
     const repo = new MemoryRepository(undefined, undefined, { fixtureAsync: false });
     const instructionCount = repo.world.instructions.length;
     const runCount = repo.world.agentRuns.length;
@@ -31,12 +43,79 @@ describe("fixture recovery service", () => {
     const blocker = await repo.submitInstruction(undefined, "What is blocking City Interiors?");
     const greeting = await repo.submitInstruction(undefined, "Hi");
 
-    expect(count.message).toContain("open recovery issues");
+    expect(count.message).toContain("open recovery cases");
     expect(affected.message).toContain("City Interiors");
     expect(blocker.message).toContain("External evidence not retrieved yet");
     expect(greeting.message).toContain("I’m Rebound");
-    expect(repo.world.instructions).toHaveLength(instructionCount);
-    expect(repo.world.agentRuns).toHaveLength(runCount);
+    expect(repo.world.instructions).toHaveLength(instructionCount + 3);
+    expect(repo.world.agentRuns).toHaveLength(runCount + 3);
+  });
+
+  it("routes selected-case chat through the configured provider with tenant-scoped context", async () => {
+    let received: { prompt: string; selectedCaseId?: string } | undefined;
+    const repo = new ChatTestRepository(async (input) => {
+      received = { prompt: input.prompt, selectedCaseId: input.selectedCaseId };
+      const view = await input.context.readCaseSummary(input.selectedCaseId!);
+      const workspace = await input.context.readWorkspaceSummary();
+      return { provider: "fireworks", model: "test-fireworks", text: `${view.customer.displayName} is in ${view.state}; ${String(workspace.openCaseCount)} cases remain open.`, steps: 2, toolCallSummaries: ["read_workspace_summary", "read_case_summary"] };
+    });
+    const city = caseByName(repo, "City Interiors");
+
+    const result = await repo.submitInstruction(city.id, "Why is City Interiors stuck?");
+
+    expect(received).toMatchObject({ prompt: "Why is City Interiors stuck?", selectedCaseId: city.id });
+    expect(result.message).toContain("City Interiors");
+    expect(result.agent).toMatchObject({ provider: "fireworks", status: "completed" });
+    expect(repo.world.agentRuns[0]).toMatchObject({ provider: "fireworks", invocationReason: "explicit_chat", status: "completed" });
+    expect(repo.world.audit.some((event) => event.eventType === "agent.chat.completed" && event.provider === "fireworks")).toBe(true);
+  });
+
+  it("uses a bounded agent action to pause only the requested case", async () => {
+    const repo = new ChatTestRepository(async (input) => {
+      const aditi = (await input.context.readWorkspaceCases()).find((item) => (item.customer as { displayName?: string })?.displayName === "Aditi Mehra")!;
+      await input.context.pauseOutreach(String(aditi.id), "Merchant requested a bounded pause");
+      return { provider: "fireworks", model: "test-fireworks", text: "Paused Aditi Mehra outreach through the deterministic policy layer.", steps: 2, toolCallSummaries: ["read_workspace_cases", "pause_outreach"] };
+    });
+    const aditi = caseByName(repo, "Aditi Mehra");
+    const city = caseByName(repo, "City Interiors");
+
+    await repo.submitInstruction(aditi.id, "Pause outreach to Aditi");
+
+    expect(repo.world.cases.find((item) => item.id === aditi.id)?.state).toBe("paused");
+    expect(repo.world.cases.find((item) => item.id === city.id)?.state).not.toBe("paused");
+    expect(repo.world.audit.some((event) => event.eventType === "case.paused" && event.entityId === aditi.id)).toBe(true);
+  });
+
+  it("keeps customer-facing chat requests as approval-gated proposals", async () => {
+    const repo = new ChatTestRepository(async (input) => {
+      const view = await input.context.readCaseSummary(input.selectedCaseId!);
+      const proposal = await input.context.createProposal({ caseId: view.id, intendedOutcome: "Offer the safest approved recovery route.", recipient: view.customer.email, scope: `${view.customer.displayName} · original purchase`, channel: "email", payload: { subject: "Safe recovery option", body: "Please review the approved recovery option.", amountMinor: view.obligation.amountDue, createPaymentLink: true }, evidenceIds: [], uncertainty: "Payment remains unverified.", explanation: "The merchant must approve any customer-facing action.", type: "recovery_message" });
+      return { provider: "fireworks", model: "test-fireworks", text: `Drafted proposal ${proposal.id}; approval is required before anything is sent.`, steps: 2, toolCallSummaries: ["read_case_summary", "propose_recovery_message"] };
+    });
+    const aditi = caseByName(repo, "Aditi Mehra");
+    const initialPaymentLinkCount = repo.world.paymentLinks.length;
+
+    await repo.submitInstruction(aditi.id, "Draft the safest next customer-facing action.");
+
+    const proposal = repo.world.proposals.find((item) => item.modelRunId === repo.world.agentRuns[0]?.id);
+    expect(proposal).toMatchObject({ status: "pending", requiresApproval: true, channel: "email" });
+    expect(repo.world.messages.filter((item) => item.direction === "outbound")).toHaveLength(0);
+    expect(repo.world.paymentLinks).toHaveLength(initialPaymentLinkCount);
+  });
+
+  it("fails closed on provider errors without a canned response or financial mutation", async () => {
+    const repo = new ChatTestRepository(async () => { throw new Error("FIREWORKS_TIMEOUT"); });
+    const city = caseByName(repo, "City Interiors");
+    const before = { state: city.state, version: city.version, instructions: repo.world.instructions.length, proposals: repo.world.proposals.length, jobs: repo.world.jobs.length };
+
+    await expect(repo.submitInstruction(city.id, "What changed today?")).rejects.toMatchObject({ code: "AGENT_PROVIDER_FAILED" });
+
+    expect(repo.world.cases.find((item) => item.id === city.id)).toMatchObject({ state: before.state, version: before.version });
+    expect(repo.world.instructions).toHaveLength(before.instructions);
+    expect(repo.world.proposals).toHaveLength(before.proposals);
+    expect(repo.world.jobs).toHaveLength(before.jobs);
+    expect(repo.world.agentRuns[0]).toMatchObject({ provider: "fireworks", status: "failed", error: "FIREWORKS_TIMEOUT" });
+    expect(repo.world.audit.some((event) => event.eventType === "agent.chat.failed")).toBe(true);
   });
 
   it("starts with a clean City Interiors case and runs one approval to one verified ledger posting", async () => {
