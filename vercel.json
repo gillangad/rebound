@@ -1,5 +1,6 @@
 {
   "framework": "nextjs",
+  "regions": ["sin1"],
   "installCommand": "npm ci",
   "buildCommand": "npm run build"
 }
